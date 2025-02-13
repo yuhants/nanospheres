@@ -40,11 +40,11 @@ sample_interval = 2
 sample_units = 'PS4000A_US'
 
 sphere = 'sphere_20250103'
-file_directory = rf"E:\dm_data\{sphere}\20250116_8e-9mbar_0e_alignment1_long"
-file_prefix = '20250116_d_'
+file_directory = rf"E:\dm_data\{sphere}\20250125_7e-9mbar_1e_alignment1_long"
+file_prefix = '20250125_d_'
 
 idx_start = 0
-n_file = 1440 - idx_start
+n_file = 1440 * 3 - idx_start
 
 # Variables used by Picoscope DAQ
 enabled = 1

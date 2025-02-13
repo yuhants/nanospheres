@@ -38,8 +38,8 @@ AMPLIFIED = True
 # FREQ = 57000 # Driving frequency in Hz
 
 ## Values at low pressure
-# OFFSET1 = 50
-# OFFSET2 = 50
+# OFFSET1 = 40
+# OFFSET2 = 40
 OFFSET1 = 0
 OFFSET2 = 0
 AMP  = 2.5

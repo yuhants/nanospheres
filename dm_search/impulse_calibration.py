@@ -26,8 +26,8 @@ amps = [2.5, 5, 7.5, 10, 12.5, 15, 17.5, 20]
 
 # Data collection setting
 sphere = 'sphere_20250103'
-file_directory = rf'E:\pulse_calibration\{sphere}\20250109_8e_alignment1_1e-8mbar_1'
-file_prefix = r'20250109_dg_8e_200ns'
+file_directory = rf'E:\pulse_calibration\{sphere}\20250117_8e_alignment1_8e-9mbar_1'
+file_prefix = r'20250117_dg_8e_200ns'
 
 serial_0 = ctypes.create_string_buffer(b'JO279/0118')  # Picoscope on cloud
 serial_1 = ctypes.create_string_buffer(b'JY140/0294')
