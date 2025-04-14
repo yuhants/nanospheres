@@ -27,9 +27,9 @@ serial_1 = ctypes.create_string_buffer(b'JY140/0294')
 # channel_ranges = np.array([9, 9, 9, 6, 5, 3, 3])
 # channel_couplings = ['DC', 'DC', 'DC', 'DC', 'DC', 'DC', 'DC']
 
-channels = ['A', 'B', 'C', 'D', 'E']
-channel_ranges = np.array([9, 9, 9, 6, 7])
-channel_couplings = ['DC', 'DC', 'DC', 'DC', 'DC']
+channels = ['A', 'B', 'C', 'D']
+channel_ranges = np.array([8, 8, 8, 6])
+channel_couplings = ['DC', 'DC', 'DC', 'DC']
 
 analog_offsets = None
 
@@ -39,12 +39,12 @@ buffer_size = int(3e7)
 sample_interval = 2
 sample_units = 'PS4000A_US'
 
-sphere = 'sphere_20250103'
-file_directory = rf"E:\dm_data\{sphere}\20250125_7e-9mbar_1e_alignment1_long"
-file_prefix = '20250125_d_'
+sphere = 'sphere_20250406'
+file_directory = rf"E:\dm_data\{sphere}\20250411_2e-8mbar_8e_alignment1_long"
+file_prefix = '20250411_d_'
 
-idx_start = 0
-n_file = 1440 * 3 - idx_start
+idx_start = 43
+n_file = 1440 - idx_start
 
 # Variables used by Picoscope DAQ
 enabled = 1

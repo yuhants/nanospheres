@@ -1,50 +1,49 @@
-"""
-This code performs impulse calibration by applying
-impulses of various different ampitudes
-"""
-
 import sys, os
 import time
 sys.path.append(os.path.dirname(r'C:\Users\yuhan\nanospheres\control'))
 
 import numpy as np
-# from control.apply_impulse import impulse_on, turn_off
-from control.src.quantum_composers_9614_control import set_pulse, turn_on, turn_off
 import matplotlib.pyplot as plt
 
+from control.src.agilent_twisstorr_84fsag_control import read_pressure
 from picosdk.ps4000a import ps4000a as ps
 from picosdk.functions import assert_pico_ok
 import ctypes
+
 import h5py
 
-# Impulse setting
+# Monitoring E field (TODO)
 # _VISA_ADDRESS_tektronix = "USB0::0x0699::0x0353::2238362::INSTR"
-# amps = [1, 3, 5, 7, 9]
+# amp, freq = 2, 89000
 # offset_1, offset_2 = 0.01, 0.01
 
-amps = [20, 17.5, 15, 12.5, 10, 7.5, 5, 2.5]
-# amps = [7.5, 5, 2.5]
-
-# Data collection setting
-sphere = 'sphere_20250406'
-file_directory = rf'E:\pulse_calibration\{sphere}\20250411_m8e_alignment1_2e-8mbar_trapping_3'
-file_prefix = r'20250411_dg_m8e_200ns'
-
+# Picoscope DAQ setting
 serial_0 = ctypes.create_string_buffer(b'JO279/0118')  # Picoscope on cloud
 serial_1 = ctypes.create_string_buffer(b'JY140/0294')
-channels = ['D', 'G']
+
 # Digitization range (0-11): 10, 20, 50, 100, 200, 500 (mV), 1, 2, 5, 10, 20, 50 (V)
-channel_ranges = np.array([6, 10])
-channel_couplings = ['DC', 'DC']
+
+channels = ['A', 'B', 'C', 'D']
+channel_ranges = np.array([8, 8, 8, 6])
+channel_couplings = ['DC', 'DC', 'DC', 'DC']
+
 analog_offsets = None
 
-# Need to sample fast enough to capture the pulses
-# here 30 million samples is 6 seconds
 n_buffer = 1  # Number of buffer to capture
 buffer_size = int(3e7)
 
+# sample_interval = 2
+# sample_units = 'PS4000A_US'
 sample_interval = 200
 sample_units = 'PS4000A_NS'
+
+sphere = 'sphere_20250406'
+file_directory = rf"E:\pulse_calibration\{sphere}\20250412_electric_calibration_2e-8mbar_2"
+file_prefix = '20250412_d_m110e_nodrive_'
+# file_prefix = '20250412_d_m110e_143khz_1vpp_trapping_'
+
+idx_start = 0
+n_file = 5
 
 # Variables used by Picoscope DAQ
 enabled = 1
@@ -60,30 +59,27 @@ def main():
     chandle, status = set_up_pico(serial_0, channels, channel_ranges, channel_couplings, analog_offsets,
                                   buffer_size)
 
-    for amp in amps:
-        # impulse_on(_VISA_ADDRESS_tektronix, amp, offset_1, offset_2)
-        set_pulse(channel=1, amp=amp, width='0.0000002', period='0.3')
-        turn_on()
-        print(f'Pulse amplitude: {amp} V')
+    # Data taking
+    for i in range(n_file):
+        pressure = read_pressure(port=r'COM7', baudrate='9600')
 
-        # Data taking
-        for i in range(10):
-            file_name = rf'{file_prefix}_{amp}v_{i}.hdf5'
-            timestamp, dt, adc2mvs, data = stream_data(chandle, status, sample_interval, sample_units, channel_ranges, buffer_size, n_buffer)
+        file_name = rf'{file_prefix}{i+idx_start}.hdf5'
+        timestamp, dt, adc2mvs, data = stream_data(chandle, status, sample_interval, sample_units, channel_ranges, buffer_size, n_buffer)
 
-            with h5py.File(os.path.join(file_directory, file_name), 'w') as f:
-                print(f'Writing file {file_name}')
+        with h5py.File(os.path.join(file_directory, file_name), 'w') as f:
+            print(f'Writing file {file_name}')
 
-                g = f.create_group('data')
-                g.attrs['timestamp'] = timestamp
-                g.attrs['delta_t'] = dt * time_dict[sample_units]
-                for i, channel in enumerate(channels):
+            g = f.create_group('data')
+            g.attrs['timestamp'] = timestamp
+            g.attrs['pressure_mbar'] = pressure
+            g.attrs['delta_t'] = dt * time_dict[sample_units]
+            for i, channel in enumerate(channels):
+                if channel == 'D':
                     dataset = g.create_dataset(f'channel_{channel.lower()}', data=data[i], dtype=np.int16)
                     dataset.attrs['adc2mv'] = adc2mvs[i]
-                f.close()
-
-        turn_off()
-        # turn_off(_VISA_ADDRESS_tektronix)
+                else:
+                    g.attrs[f'channel_{channel.lower()}_mean_mv'] = np.mean(data[i]) * adc2mvs[i]
+            f.close()
 
     stop_and_disconnect(chandle, status)
 

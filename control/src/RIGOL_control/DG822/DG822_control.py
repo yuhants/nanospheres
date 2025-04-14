@@ -4,7 +4,7 @@ import numpy as np
 from typing import Tuple, List, Union
 import time
 
-_VISA_ADDRESS = "USB0::0x1AB1::0x0643::DG8A204201834::INSTR"
+#_VISA_ADDRESS = "USB0::0x1AB1::0x0643::DG8A204201834::INSTR"
 
 class FuncGen:
 
@@ -14,7 +14,7 @@ class FuncGen:
     
     def open(self, visa_address):
         rm = pyvisa.ResourceManager()
-        self._inst = rm.open_resource(_VISA_ADDRESS)
+        self._inst = rm.open_resource(visa_address)
         self.write("*CLS")
         self._id = self.query("*IDN?") 
         self._maker, self._model, self._serial = self._id.split(",")[:3]
@@ -48,6 +48,60 @@ class FuncGen:
         self.write(cmd)
 
         cmd = f"{source}FUNCtion:PULSe:DCYCle {duty}"
+        self.write(cmd)
+
+    def sin_wave(self, channel=1, amp=1, off=0, freq=1000, phase = 0):
+    
+        source = f"SOURce{channel}:"
+
+        shape = "SINusoid"
+        cmd = f"{source}FUNCtion:SHAPe {shape}"
+        self.write(cmd)
+
+        unit = "Vpp"
+        cmd = f"{source}VOLTage:LEVel {amp}{unit}"
+        self.write(cmd)
+
+        unit = "V"
+        cmd = f"{source}VOLTage:OFFSet  {off}{unit}"
+        self.write(cmd)
+
+        unit = "Hz"
+        cmd = f"{source}FREQuency:FIXed  {freq}{unit}"
+        self.write(cmd)
+
+        cmd = f"{source}PHASe:ADJust {phase}"
+        self.write(cmd)
+
+    def change_amplitude(self, channel = 1, amp = 1):
+        
+        source = f"SOURce{channel}:"
+        
+        unit = "Vpp"
+        cmd = f"{source}VOLTage:LEVel {amp}{unit}"
+        self.write(cmd)
+    
+    def syncronise_waveforms(self):
+        """Syncronise waveforms of the two channels when using the same frequency
+        Note: Does NOT enable the frequency lock that can be enabled on the
+        user interface of the instrument)
+        """
+        #cmd = f":SOUR1:PHAS:SYNC"
+        #self.write(cmd)
+        cmd = f":PHAS:SYNC"
+        self.write(cmd)
+        print("waveforms aligned")
+
+    def DC(self, channel=1, off=1):
+    
+        source = f"SOURce{channel}:"
+
+        shape = "DC"
+        cmd = f"{source}FUNCtion:SHAPe {shape}"
+        self.write(cmd)
+
+        unit = "V"
+        cmd = f"{source}VOLTage:OFFSet  {off}{unit}"
         self.write(cmd)
 
     def turn_on(self, channel = 1):

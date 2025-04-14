@@ -22,8 +22,8 @@ TODO: need to add the bit that collects and analyses the data.
 _VISA_ADDRESS_tektronix = "USB0::0x0699::0x0353::2238362::INSTR"
 
 ### Variables
-AMPLIFIED = True
-# AMPLIFIED = False
+# AMPLIFIED = True
+AMPLIFIED = False
 
 # DC bias in V
 
@@ -42,7 +42,7 @@ AMPLIFIED = True
 # OFFSET2 = 40
 OFFSET1 = 0
 OFFSET2 = 0
-AMP  = 2.5
+AMP  = 1
 FREQ = 93000
 
 if AMPLIFIED:
