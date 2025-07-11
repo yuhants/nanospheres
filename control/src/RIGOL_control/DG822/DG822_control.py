@@ -80,7 +80,18 @@ class FuncGen:
         unit = "Vpp"
         cmd = f"{source}VOLTage:LEVel {amp}{unit}"
         self.write(cmd)
-    
+
+    def change_offset(self, channel = 1, off = 1):
+        source = f"SOURce{channel}:"
+        unit = "V"
+        cmd = f"{source}VOLTage:OFFSet  {off}{unit}"
+        self.write(cmd)
+        
+    def change_phase(self, channel = 1, phase = 0):
+        source = f"SOURce{channel}:"
+        cmd = f"{source}PHASe {phase}"
+        self.write(cmd)
+
     def syncronise_waveforms(self):
         """Syncronise waveforms of the two channels when using the same frequency
         Note: Does NOT enable the frequency lock that can be enabled on the

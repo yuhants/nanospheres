@@ -12,39 +12,53 @@ import ctypes
 
 import h5py
 
-# Monitoring E field (TODO)
-# _VISA_ADDRESS_tektronix = "USB0::0x0699::0x0353::2238362::INSTR"
-# amp, freq = 2, 89000
-# offset_1, offset_2 = 0.01, 0.01
-
 # Picoscope DAQ setting
 serial_0 = ctypes.create_string_buffer(b'JO279/0118')  # Picoscope on cloud
 serial_1 = ctypes.create_string_buffer(b'JY140/0294')
 
+data_type = 'no_eb'
+# data_type = 'no_e'
+# data_type = 'no_b'
+# data_type = 'full'
+
 # Digitization range (0-11): 10, 20, 50, 100, 200, 500 (mV), 1, 2, 5, 10, 20, 50 (V)
+if data_type == 'no_eb':
+    channels = ['A', 'B', 'C', 'D']
+    channel_ranges = np.array([8, 8, 8, 6])
+    channel_couplings = ['DC', 'DC', 'DC', 'DC']
 
-# channels = ['A', 'B', 'C', 'D', 'E', 'F', 'G']
-# channel_ranges = np.array([9, 9, 9, 6, 5, 3, 3])
-# channel_couplings = ['DC', 'DC', 'DC', 'DC', 'DC', 'DC', 'DC']
+elif data_type == 'no_e':
+    channels = ['A', 'B', 'C', 'D', 'F']
+    channel_ranges = np.array([8, 8, 8, 6, 8])
+    channel_couplings = ['DC', 'DC', 'DC', 'DC', 'DC']
 
-channels = ['D', 'F']
-channel_ranges = np.array([6, 10])
-channel_couplings = ['DC', 'DC']
+elif data_type == 'no_b':
+    channels = ['A', 'B', 'C', 'D', 'G']
+    channel_ranges = np.array([8, 8, 8, 6, 6])
+    channel_couplings = ['DC', 'DC', 'DC', 'DC', 'DC']
+
+if data_type == 'full':
+    channels = ['A', 'B', 'C', 'D', 'F', 'G']
+    channel_ranges = np.array([8, 8, 8, 6, 8, 6])
+    channel_couplings = ['DC', 'DC', 'DC', 'DC', 'DC', 'DC']
 
 analog_offsets = None
 
 n_buffer = 1  # Number of buffer to capture
-buffer_size = int(1e7)
+buffer_size = int(3e7)
 
-sample_interval = 1000
-sample_units = 'PS4000A_NS'
+sample_interval = 2
+sample_units = 'PS4000A_US'
 
-sphere = 'sphere_20250327'
-file_directory = rf"E:\lorentz_force\{sphere}\20250328\Perm mag\2.5 V\Background 2"
-file_prefix = 'tt'
+sphere = 'sphere_20250708'
+file_directory = rf"E:\lorentz_force\{sphere}\20250711_5e-8mbar"
+file_prefix = '20250711_minus160e_noeb_'
+# file_prefix = '20250711_minus160e_b4_7khz_'
+# file_prefix = '20250711_minus160e_e69khz_0_35vpp'
+# file_prefix = '20250711_minus160e_b4_7khz_e69khz_0_35vpp_'
 
 idx_start = 0
-n_file = 2
+n_file = 1
 
 # Variables used by Picoscope DAQ
 enabled = 1
@@ -75,11 +89,11 @@ def main():
             g.attrs['pressure_mbar'] = pressure
             g.attrs['delta_t'] = dt * time_dict[sample_units]
             for i, channel in enumerate(channels):
-                if channel == 'D':
-                    dataset = g.create_dataset(f'channel_{channel.lower()}', data=data[i], dtype=np.int16)
-                    dataset.attrs['adc2mv'] = adc2mvs[i]
-                else:
-                    g.attrs[f'channel_{channel.lower()}_mean_mv'] = np.mean(data[i]) * adc2mvs[i]
+                #if channel == 'D' or 'F':
+                dataset = g.create_dataset(f'channel_{channel.lower()}', data=data[i], dtype=np.int16)
+                dataset.attrs['adc2mv'] = adc2mvs[i]
+                #else:
+                   # g.attrs[f'channel_{channel.lower()}_mean_mv'] = np.mean(data[i]) * adc2mvs[i]
             f.close()
 
     stop_and_disconnect(chandle, status)
