@@ -1,0 +1,22 @@
+{
+  "picoscope": "Cloud  (JO279/0118)",
+  "channels": {
+    "A": {"enabled": true,  "range_idx": 9, "coupling": "DC", "save_mode": "Full"},
+    "B": {"enabled": true,  "range_idx": 9, "coupling": "DC", "save_mode": "Full"},
+    "C": {"enabled": true,  "range_idx": 9, "coupling": "DC", "save_mode": "Full"},
+    "D": {"enabled": true,  "range_idx": 6, "coupling": "DC", "save_mode": "Full"},
+    "E": {"enabled": false, "range_idx": 7, "coupling": "DC", "save_mode": "Full"},
+    "F": {"enabled": false, "range_idx": 7, "coupling": "DC", "save_mode": "Full"},
+    "G": {"enabled": true,  "range_idx": 9, "coupling": "DC", "save_mode": "Full"},
+    "H": {"enabled": false, "range_idx": 7, "coupling": "DC", "save_mode": "Full"}
+  },
+  "sample_interval": 800,
+  "sample_units": "PS4000A_NS",
+  "buffer_size": 8388608,
+  "n_files": 10000,
+  "idx_start": 0,
+  "file_directory": "E:\\lorentz_force\\sphere_YYYYMMDD\\YYYYMMDD_run",
+  "file_prefix": "YYYYMMDD_abcdg_",
+  "read_pressure": true,
+  "pressure_port": "COM7"
+}

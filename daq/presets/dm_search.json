@@ -1,0 +1,22 @@
+{
+  "picoscope": "Cloud  (JO279/0118)",
+  "channels": {
+    "A": {"enabled": false, "range_idx": 8, "coupling": "DC", "save_mode": "Mean"},
+    "B": {"enabled": false, "range_idx": 8, "coupling": "DC", "save_mode": "Mean"},
+    "C": {"enabled": false, "range_idx": 8, "coupling": "DC", "save_mode": "Mean"},
+    "D": {"enabled": true,  "range_idx": 6, "coupling": "DC", "save_mode": "Full"},
+    "E": {"enabled": false, "range_idx": 7, "coupling": "DC", "save_mode": "Full"},
+    "F": {"enabled": false, "range_idx": 7, "coupling": "DC", "save_mode": "Full"},
+    "G": {"enabled": false, "range_idx": 7, "coupling": "DC", "save_mode": "Full"},
+    "H": {"enabled": false, "range_idx": 7, "coupling": "DC", "save_mode": "Full"}
+  },
+  "sample_interval": 2,
+  "sample_units": "PS4000A_US",
+  "buffer_size": 33554432,
+  "n_files": 1440,
+  "idx_start": 0,
+  "file_directory": "E:\\dm_data\\sphere_YYYYMMDD\\YYYYMMDD_run",
+  "file_prefix": "YYYYMMDD_d_",
+  "read_pressure": true,
+  "pressure_port": "COM7"
+}

@@ -6,49 +6,38 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 from control.src.agilent_twisstorr_84fsag_control import read_pressure
-from control.src.RIGOL_control.DP821.DP821_control import Supply
 from picosdk.ps4000a import ps4000a as ps
 from picosdk.functions import assert_pico_ok
 import ctypes
 
 import h5py
 
-_VISA_ADDRESS_rigol_dp821 = 'USB0::0x1AB1::0x0E11::DP8G223300057::INSTR'
-
 # Picoscope DAQ setting
 serial_0 = ctypes.create_string_buffer(b'JO279/0118')  # Picoscope on cloud
 serial_1 = ctypes.create_string_buffer(b'JY140/0294')
 
-data_type = 'full'
-
 # Digitization range (0-11): 10, 20, 50, 100, 200, 500 (mV), 1, 2, 5, 10, 20, 50 (V)
-if data_type == 'full':
-    channels = ['A', 'B', 'C', 'D', 'G']
-    channel_ranges = np.array([9, 9, 9, 6, 9])
-    channel_couplings = ['DC', 'DC', 'DC', 'DC', 'DC']
+
+channels = ['C', 'E', 'F', 'G']
+channel_ranges = np.array([7, 9, 9, 7])
+channel_couplings = ['DC', 'DC', 'DC', 'DC']
 
 analog_offsets = None
 
 n_buffer = 1  # Number of buffer to capture
-# buffer_size = int(3e6)
-# buffer_size = int(2**22)
-buffer_size = int(2**23)
+buffer_size = int(2**25)
 
 # sample_interval = 2
 # sample_units = 'PS4000A_US'
-sample_interval = 800
+sample_interval = 200
 sample_units = 'PS4000A_NS'
 
-sphere = 'sphere_20250708'
-file_directory = rf"E:\lorentz_force\{sphere}\20250813_2e-8mbar_midfreq_fcancel"
-file_prefix = '20250813_m350e_276khz_350vpp_'
-# file_directory = rf"E:\lorentz_force\{sphere}\20250808_2e-8mbar_electric_calibration"
-# file_prefix = '20250808_m350e_93khz_2_5vpp_'
+sphere = 'sphere_20260403'
+file_directory = rf"E:\charging_data\{sphere}\1_1mbar"
+file_prefix = '20260413_cefg_'
 
-# idx_start = 0
-# n_file = 1
-idx_start = 724
-n_file = 10000 - idx_start
+idx_start = 0
+n_file = 10 - idx_start
 
 # Variables used by Picoscope DAQ
 enabled = 1
@@ -58,14 +47,6 @@ channel_dict = {'A':0, 'B':1, 'C':2, 'D':3, 'E':4, 'F':5, 'G':6, 'H':7}
 time_dict = {'PS4000A_NS':1e-9, 'PS4000A_US':1e-6, 'PS4000A_MS':1e-3}
 
 def main():
-    # Set up the power supply
-    dp821 = Supply(_VISA_ADDRESS_rigol_dp821)
-    dp821.apply(channel='CH1', voltage=12, current=0.5)
-    dp821.apply(channel='CH2', voltage=8.4, current=10.5)
-
-    dp821.turn_off(channel='CH1')
-    dp821.turn_off(channel='CH2')
-
     if not os.path.isdir(file_directory):
         os.mkdir(file_directory)
 
@@ -73,22 +54,10 @@ def main():
                                   buffer_size)
 
     # Data taking
-    for idx in range(n_file):            
+    for i in range(n_file):
         pressure = read_pressure(port=r'COM7', baudrate='9600')
 
-        # With B field on
-        try:
-            dp821.turn_on(channel='CH2')
-        except:
-            print('Somethings wrong!')
-            dp821 = Supply(_VISA_ADDRESS_rigol_dp821)
-            dp821.turn_on(channel='CH2')
-
-        time.sleep(0.75)   # Wait 1 sec for the transient to settle
-        flip_info = dp821.get_info(channel='CH1')
-        drive_info = dp821.get_info(channel='CH2')
-
-        file_name = rf'{file_prefix}{'withb_'}{idx+idx_start}.hdf5'
+        file_name = rf'{file_prefix}{i+idx_start}.hdf5'
         timestamp, dt, adc2mvs, data = stream_data(chandle, status, sample_interval, sample_units, channel_ranges, buffer_size, n_buffer)
 
         with h5py.File(os.path.join(file_directory, file_name), 'w') as f:
@@ -97,89 +66,11 @@ def main():
             g = f.create_group('data')
             g.attrs['timestamp'] = timestamp
             g.attrs['pressure_mbar'] = pressure
-            g.attrs['flip_info'] = flip_info
-            g.attrs['drive_info'] = drive_info
             g.attrs['delta_t'] = dt * time_dict[sample_units]
             for i, channel in enumerate(channels):
-                if channel == 'D' or channel == 'G':
-                    dataset = g.create_dataset(f'channel_{channel.lower()}', data=data[i], dtype=np.int16)
-                    dataset.attrs['adc2mv'] = adc2mvs[i]
-                else:
-                    g.attrs[f'channel_{channel.lower()}_mean_mv'] = np.mean(data[i]) * adc2mvs[i]
+                dataset = g.create_dataset(f'channel_{channel.lower()}', data=data[i], dtype=np.int16)
+                dataset.attrs['adc2mv'] = adc2mvs[i]
             f.close()
-
-        # With B field flipped
-        try:
-            dp821.turn_on(channel='CH1')
-        except:
-            print('Somethings wrong!')
-            dp821 = Supply(_VISA_ADDRESS_rigol_dp821)
-            dp821.turn_on(channel='CH1')
-
-        time.sleep(0.75)   # Wait 1 sec for the transient to settle
-        flip_info = dp821.get_info(channel='CH1')
-        drive_info = dp821.get_info(channel='CH2')
-
-        file_name = rf'{file_prefix}{'withb_flipped_'}{idx+idx_start}.hdf5'
-        timestamp, dt, adc2mvs, data = stream_data(chandle, status, sample_interval, sample_units, channel_ranges, buffer_size, n_buffer)
-
-        with h5py.File(os.path.join(file_directory, file_name), 'w') as f:
-            print(f'Writing file {file_name}')
-
-            g = f.create_group('data')
-            g.attrs['timestamp'] = timestamp
-            g.attrs['pressure_mbar'] = pressure
-            g.attrs['flip_info'] = flip_info
-            g.attrs['drive_info'] = drive_info
-            g.attrs['delta_t'] = dt * time_dict[sample_units]
-            for i, channel in enumerate(channels):
-                if channel == 'D' or channel == 'G':
-                    dataset = g.create_dataset(f'channel_{channel.lower()}', data=data[i], dtype=np.int16)
-                    dataset.attrs['adc2mv'] = adc2mvs[i]
-                else:
-                    g.attrs[f'channel_{channel.lower()}_mean_mv'] = np.mean(data[i]) * adc2mvs[i]
-            f.close()
-
-        # No B field on
-        try:
-            dp821.turn_off(channel='CH1')
-            dp821.turn_off(channel='CH2')
-        except:
-            print('Somethings wrong!')
-            dp821 = Supply(_VISA_ADDRESS_rigol_dp821)
-            dp821.turn_off(channel='CH1')
-            dp821.turn_off(channel='CH2')
-
-        time.sleep(0.75)   # Wait 1 sec for the transient to settle
-        flip_info = dp821.get_info(channel='CH1')
-        drive_info = dp821.get_info(channel='CH2')
-
-        file_name = rf'{file_prefix}{'nob_'}{idx+idx_start}.hdf5'
-        timestamp, dt, adc2mvs, data = stream_data(chandle, status, sample_interval, sample_units, channel_ranges, buffer_size, n_buffer)
-
-        with h5py.File(os.path.join(file_directory, file_name), 'w') as f:
-            print(f'Writing file {file_name}')
-
-            g = f.create_group('data')
-            g.attrs['timestamp'] = timestamp
-            g.attrs['pressure_mbar'] = pressure
-            g.attrs['flip_info'] = flip_info
-            g.attrs['drive_info'] = drive_info
-            g.attrs['delta_t'] = dt * time_dict[sample_units]
-            for i, channel in enumerate(channels):
-                if channel == 'D' or channel == 'G':
-                    dataset = g.create_dataset(f'channel_{channel.lower()}', data=data[i], dtype=np.int16)
-                    dataset.attrs['adc2mv'] = adc2mvs[i]
-                else:
-                    g.attrs[f'channel_{channel.lower()}_mean_mv'] = np.mean(data[i]) * adc2mvs[i]
-            f.close()
-
-        print(f'Channel A mean: {np.mean(data[0])*adc2mvs[0]}; Channel B mean: {np.mean(data[1])*adc2mvs[1]}; Channel D mean: {np.mean(data[3])*adc2mvs[3]}')
-        while (np.mean(data[0])*adc2mvs[0] < -4000 or (np.mean(data[1])*adc2mvs[1]) < -4000):
-            print('Let cool off for a while')
-            time.sleep(60 * 15)  # Rest for 15 min to dissipate some heat
-            timestamp, dt, adc2mvs, data = stream_data(chandle, status, sample_interval, sample_units, channel_ranges, buffer_size, n_buffer)
-            print(f'Channel A mean: {np.mean(data[0])*adc2mvs[0]}; Channel B mean: {np.mean(data[1])*adc2mvs[1]}; Channel D mean: {np.mean(data[3])*adc2mvs[3]}')
 
     stop_and_disconnect(chandle, status)
 

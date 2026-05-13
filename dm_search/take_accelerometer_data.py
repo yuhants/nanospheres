@@ -18,20 +18,31 @@ serial_1 = ctypes.create_string_buffer(b'JY140/0294')
 
 # Digitization range (0-11): 10, 20, 50, 100, 200, 500 (mV), 1, 2, 5, 10, 20, 50 (V)
 channels = ['A']
-channel_ranges = np.array([8])
+channel_ranges = np.array([7])
 channel_couplings = ['DC']
+
+# channels = ['G']
+# channel_ranges = np.array([0])
+# channel_couplings = ['AC']
 
 analog_offsets = None
 
 n_buffer = 1  # Number of buffer to capture
-buffer_size = int(3e7)
+buffer_size = int(2**20)
 
+# sample_interval = 200
+# sample_units = 'PS4000A_NS'
 sample_interval = 200
 sample_units = 'PS4000A_US'
 
-file_directory = r"D:\accelerometer\20241204_accelerometer_ontable_srsgain2000_overnight"
-file_prefix = '20241204_a_'
-n_file = 15
+# file_directory = r"D:\accelerometer\20241204_accelerometer_ontable_srsgain2000_overnight"
+# file_directory = r"D:\power_monitor\20251007_power_monitor"
+# file_prefix = '202501007_g_'
+# n_file = 1
+
+file_directory = r"D:\accelerometer\20251013_accelerometer_ontable_gain_1000V_g"
+file_prefix = '20251013_a_'
+n_file = 1
 
 # Variables used by Picoscope DAQ
 enabled = 1
@@ -44,8 +55,9 @@ def main():
     if not os.path.isdir(file_directory):
         os.mkdir(file_directory)
 
-    chandle, status = set_up_pico(serial_1, channels, channel_ranges, channel_couplings, analog_offsets,
+    chandle, status = set_up_pico(serial_0, channels, channel_ranges, channel_couplings, analog_offsets,
                                   buffer_size)
+    # time.sleep(25)
 
     # Data taking
     for i in range(n_file):

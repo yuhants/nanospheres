@@ -25,17 +25,19 @@ channel_couplings = ['DC', 'DC']
 analog_offsets = None
 
 n_buffer = 1  # Number of buffer to capture
-buffer_size = int(3e7)
+buffer_size = int(2**25)
 
-sample_interval = 2
-sample_units = 'PS4000A_US'
+# sample_interval = 2
+# sample_units = 'PS4000A_US'
+sample_interval = 200
+sample_units = 'PS4000A_NS'
 
-sphere = 'sphere_20250406'
-file_directory = rf"E:\reheating_data\{sphere}\1_4e-6mbar"
-file_prefix = '20250412_df_'
+sphere = 'sphere_20251212'
+file_directory = rf"E:\gas_collisions\reheating_data\{sphere}\4_1e-8mbar"
+file_prefix = '20251218_df_'
 
 idx_start = 0
-n_file = 20 - idx_start
+n_file = 200 - idx_start
 
 # Variables used by Picoscope DAQ
 enabled = 1

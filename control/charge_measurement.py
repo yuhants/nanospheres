@@ -22,29 +22,33 @@ TODO: need to add the bit that collects and analyses the data.
 _VISA_ADDRESS_tektronix = "USB0::0x0699::0x0353::2238362::INSTR"
 
 ### Variables
-# AMPLIFIED = True
-AMPLIFIED = False
+AMPLIFIED = True
+# AMPLIFIED = False
 
 # DC bias in V
-
-# OFFSET1 = 60
-# OFFSET2 = 60
+# OFFSET1 = 40
+# OFFSET2 = 40
 # OFFSET1 = -40
 # OFFSET2 = -40
 # OFFSET1 = 0
 # OFFSET2 = 0
 
-# AMP  = 60    # Peak-to-peak amplitude of the driving E field @ 1 mbar
-# FREQ = 57000 # Driving frequency in Hz
+AMP  = 60    # Peak-to-peak amplitude of the driving E field @ 1 mbar
+FREQ = 67321 # Driving frequency in Hz
 
 ## Values at low pressure
-# OFFSET1 = 40
-# OFFSET2 = 40
+# OFFSET1 = -40
+# OFFSET2 = -40
 OFFSET1 = 0
 OFFSET2 = 0
-AMP  = 2.5
-FREQ = 93000
-# FREQ = 147000
+
+# AMP = 5
+# FREQ = 87000
+# AMP = 1
+# FREQ = 137000
+
+# AMP = 1.5
+# FREQ = 117000
 
 if AMPLIFIED:
     AMP = AMP / 20

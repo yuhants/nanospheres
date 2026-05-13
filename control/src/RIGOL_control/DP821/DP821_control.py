@@ -46,9 +46,9 @@ if __name__ == '__main__':
     supply.apply(channel='CH2', voltage=8.4, current=10.5)
 
     supply.turn_on(channel='CH2')
-    time.sleep(1)
+    time.sleep(2)
     supply.turn_on(channel='CH1')
-    time.sleep(1)
+    time.sleep(2)
     supply.turn_off(channel='CH1')
     supply.turn_off(channel='CH2')
     # print(supply.get_info(channel='CH2'))

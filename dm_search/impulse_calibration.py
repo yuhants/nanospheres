@@ -10,6 +10,7 @@ sys.path.append(os.path.dirname(r'C:\Users\yuhan\nanospheres\control'))
 import numpy as np
 # from control.apply_impulse import impulse_on, turn_off
 from control.src.quantum_composers_9614_control import set_pulse, turn_on, turn_off
+from control.src.agilent_twisstorr_84fsag_control import read_pressure
 import matplotlib.pyplot as plt
 
 from picosdk.ps4000a import ps4000a as ps
@@ -18,30 +19,31 @@ import ctypes
 import h5py
 
 # Impulse setting
-# _VISA_ADDRESS_tektronix = "USB0::0x0699::0x0353::2238362::INSTR"
-# amps = [1, 3, 5, 7, 9]
-# offset_1, offset_2 = 0.01, 0.01
+# amps = [20, 17.5, 15, 12.5, 10, 7.5, 5, 2.5]
+# amps = [2.5, 5., 7.5, 10., 12.5, 15., 17.5, 20.]
+amps = [2.5]
 
-amps = [20, 17.5, 15, 12.5, 10, 7.5, 5, 2.5]
-# amps = [7.5, 5, 2.5]
+nfiles = 5
+# nfiles = 150
 
 # Data collection setting
-sphere = 'sphere_20250406'
-file_directory = rf'E:\pulse_calibration\{sphere}\20250411_m8e_alignment1_2e-8mbar_trapping_3'
-file_prefix = r'20250411_dg_m8e_200ns'
+sphere = 'sphere_20260215'
+file_directory = rf'E:\gas_collisions\pulse_calibration\{sphere}\20260219_p6e_4e-8mbar_d137khz_3_aftersf6'
+# file_directory = rf'E:\gas_collisions\pulse_calibration\{sphere}\20260218_p6e_4e-8mbar_d137khz_gas_trial'
+file_prefix = r'20260219_dfg_p6e_200ns'
 
 serial_0 = ctypes.create_string_buffer(b'JO279/0118')  # Picoscope on cloud
 serial_1 = ctypes.create_string_buffer(b'JY140/0294')
-channels = ['D', 'G']
+channels = ['D', 'F', 'G']
 # Digitization range (0-11): 10, 20, 50, 100, 200, 500 (mV), 1, 2, 5, 10, 20, 50 (V)
-channel_ranges = np.array([6, 10])
-channel_couplings = ['DC', 'DC']
+channel_ranges = np.array([5, 7, 10])
+channel_couplings = ['DC', 'DC', 'DC']
 analog_offsets = None
 
 # Need to sample fast enough to capture the pulses
 # here 30 million samples is 6 seconds
 n_buffer = 1  # Number of buffer to capture
-buffer_size = int(3e7)
+buffer_size = int(2**25)
 
 sample_interval = 200
 sample_units = 'PS4000A_NS'
@@ -62,12 +64,16 @@ def main():
 
     for amp in amps:
         # impulse_on(_VISA_ADDRESS_tektronix, amp, offset_1, offset_2)
-        set_pulse(channel=1, amp=amp, width='0.0000002', period='0.3')
+        # set_pulse(channel=1, amp=amp, width='0.0000002', period='0.3')
+        set_pulse(channel=1, amp=amp, width='0.0000002', period='0.15')
+
         turn_on()
         print(f'Pulse amplitude: {amp} V')
 
+        pressure = read_pressure(port=r'COM7', baudrate='9600')
+
         # Data taking
-        for i in range(10):
+        for i in range(nfiles):
             file_name = rf'{file_prefix}_{amp}v_{i}.hdf5'
             timestamp, dt, adc2mvs, data = stream_data(chandle, status, sample_interval, sample_units, channel_ranges, buffer_size, n_buffer)
 
@@ -76,6 +82,7 @@ def main():
 
                 g = f.create_group('data')
                 g.attrs['timestamp'] = timestamp
+                g.attrs['pressure_mbar'] = pressure
                 g.attrs['delta_t'] = dt * time_dict[sample_units]
                 for i, channel in enumerate(channels):
                     dataset = g.create_dataset(f'channel_{channel.lower()}', data=data[i], dtype=np.int16)

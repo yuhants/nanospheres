@@ -23,24 +23,24 @@ serial_1 = ctypes.create_string_buffer(b'JY140/0294')
 
 # Digitization range (0-11): 10, 20, 50, 100, 200, 500 (mV), 1, 2, 5, 10, 20, 50 (V)
 
-channels = ['A', 'B', 'C', 'D']
-channel_ranges = np.array([8, 8, 8, 6])
-channel_couplings = ['DC', 'DC', 'DC', 'DC']
+channels = ['D']
+channel_ranges = np.array([5])
+channel_couplings = ['DC']
 
 analog_offsets = None
 
 n_buffer = 1  # Number of buffer to capture
-buffer_size = int(3e7)
+buffer_size = int(2**25)
 
 # sample_interval = 2
 # sample_units = 'PS4000A_US'
 sample_interval = 200
 sample_units = 'PS4000A_NS'
 
-sphere = 'sphere_20250406'
-file_directory = rf"E:\pulse_calibration\{sphere}\20250412_electric_calibration_2e-8mbar_2"
-file_prefix = '20250412_d_m110e_nodrive_'
-# file_prefix = '20250412_d_m110e_143khz_1vpp_trapping_'
+sphere = 'sphere_20260215'
+file_directory = rf"E:\gas_collisions\pulse_calibration\{sphere}\20260305_electric_calibration_3e-8mbar_0"
+# file_prefix = '20260107_d_p8e_nodrive_'
+file_prefix = '20260305_d_p5e_117khz_1.5vpp_lensholder1_'
 
 idx_start = 0
 n_file = 5
