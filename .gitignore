@@ -1,0 +1,10 @@
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.vscode/
+
+# Vendor SDKs
+scientific_camera_interfaces_windows-2.1/

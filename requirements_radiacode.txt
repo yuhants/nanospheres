@@ -1,0 +1,7 @@
+# RadiaCode multi-device GUI dependencies
+bleak>=0.21.0          # Cross-platform BLE (replaces Linux-only bluepy)
+radiacode>=0.3.0       # Protocol types and decoders
+h5py>=3.0              # HDF5 data logging
+numpy>=1.21            # Array handling for spectrum data
+matplotlib>=3.5        # Spectrum and time-series plots
+PyQt5>=5.15            # GUI framework (already in use)
