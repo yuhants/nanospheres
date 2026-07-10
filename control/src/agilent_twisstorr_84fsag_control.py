@@ -3,7 +3,8 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-SERIAL_PORT = r'COM6'
+# SERIAL_PORT = r'COM6'
+SERIAL_PORT = r'COM7'
 
 def start(port=SERIAL_PORT, baudrate='9600'):
     ser = serial.Serial(port, baudrate, timeout=1)
@@ -21,7 +22,8 @@ def read_pressure(port=SERIAL_PORT, baudrate='9600'):
         pressure_str = response[6:13].decode('UTF-8')
 
         ser.close()
-
+        
+        # return float(1)
         return float(pressure_str)
     except Exception as e:
         print(e)

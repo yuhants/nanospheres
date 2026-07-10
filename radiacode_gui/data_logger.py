@@ -4,7 +4,7 @@ Use :func:`create_logger` to build a logger from a :class:`LogConfig`. Both
 backends expose the same interface::
 
     log_realtime(item)   # RealTimeData  (count rate / dose rate, ~1 Hz)
-    log_status(item)     # RareData      (temperature / battery, slow)
+    log_status(item)     # RareData      (temperature / battery, ~1 Hz)
     log_spectrum(spec)   # Spectrum      (energy histogram snapshot)
     close()
 
@@ -36,7 +36,7 @@ class LogConfig:
 
     fmt: str = FORMAT_HDF5            # FORMAT_HDF5 or FORMAT_CSV
     save_realtime: bool = True        # count rate + dose rate (~1 Hz)
-    save_status: bool = True          # temperature + battery (RareData)
+    save_status: bool = True          # temperature + battery (~1 Hz)
     save_spectrum: bool = True        # energy spectrum snapshots
 
     def copy(self) -> 'LogConfig':

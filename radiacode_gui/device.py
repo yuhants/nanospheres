@@ -168,3 +168,19 @@ class RadiaCodeBLE:
     async def energy_calib(self) -> List[float]:
         r = await self._read_vs(VS.ENERGY_CALIB)
         return list(r.unpack('<fff'))
+
+    async def read_temperature(self) -> float:
+        """Read the live device temperature (°C) directly from a register.
+
+        Unlike temperature carried in the periodic RareData buffer packet
+        (which the device emits only every tens of seconds), the ``TEMP_degC``
+        virtual SFR can be polled on demand, so temperature can be logged at
+        the same ~1 Hz cadence as the count rate. The register holds an IEEE-754
+        float32; the batch-read transport returns it as a raw uint32, so we
+        reinterpret the bytes.
+        """
+        r = await self._execute(
+            COMMAND.RD_VIRT_SFR_BATCH, struct.pack('<I', int(VSFR.TEMP_degC))
+        )
+        raw = r.unpack('<I')[0]
+        return struct.unpack('<f', struct.pack('<I', raw))[0]

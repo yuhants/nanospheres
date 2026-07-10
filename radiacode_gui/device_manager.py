@@ -6,6 +6,7 @@ safely via QueuedConnection (Qt's default for cross-thread signals).
 """
 
 import asyncio
+import datetime
 import logging
 import threading
 from typing import Dict, List, Optional, Tuple
@@ -26,6 +27,11 @@ _SPECTRUM_INTERVAL = 5
 # The device reports dose_rate as a raw float in R/h (roentgen/hour); the GUI
 # displays µSv/h. With 1 R ≈ 0.01 Sv: µSv/h = raw[R/h] * 1e6 * 0.01 = raw * 1e4.
 _DOSE_RATE_TO_USV_H = 1e4
+
+# BLE resilience: a single dropped notification or read timeout is transient and
+# must not tear down the whole session. Tolerate this many consecutive poll
+# errors (while the link is still up) before giving up.
+_MAX_CONSECUTIVE_ERRORS = 5
 
 
 class DeviceManager(QObject):
@@ -67,6 +73,13 @@ class DeviceManager(QObject):
         self._logging_on:  bool                           = False
         self._log_config:  LogConfig                      = LogConfig()
 
+        # Serialises all BLE adapter access. On Windows, running a scan while a
+        # device is connected (or while the poll loop is mid-read) drops the
+        # active link — after which the RadiaCode auto-powers off. Holding this
+        # lock around scanning, connecting, and each poll read guarantees the
+        # scanner is never active at the same time as a live connection.
+        self._ble_lock = asyncio.Lock()
+
     # ------------------------------------------------------------------ #
     #  Public API (called from Qt thread)                                 #
     # ------------------------------------------------------------------ #
@@ -75,7 +88,15 @@ class DeviceManager(QObject):
         self._output_dir = path
 
     def set_log_config(self, config: LogConfig) -> None:
-        """Update what/how to record. Reopens loggers if already recording."""
+        """Update what/how to record. Reopens loggers if already recording.
+
+        No-op (keeps the current file open) if the config is unchanged, so
+        e.g. dismissing the settings dialog without edits doesn't split the
+        active log file — which would otherwise reset the wait for the next
+        slow-arriving RareData (temperature/battery) sample.
+        """
+        if config == self._log_config:
+            return
         self._log_config = config.copy()
         if self._logging_on:
             # Apply the new config by cycling loggers off then on.
@@ -165,7 +186,11 @@ class DeviceManager(QObject):
 
     async def _do_scan(self, timeout: float) -> None:
         try:
-            results = await scan_devices(timeout)
+            # Exclusive adapter access: pauses all poll-loop reads and blocks
+            # connects for the duration of the scan, so scanning can't knock a
+            # connected device off the air.
+            async with self._ble_lock:
+                results = await scan_devices(timeout)
             self.scan_finished.emit(results)
         except Exception as e:
             log.error('Scan error: %s', e)
@@ -182,9 +207,12 @@ class DeviceManager(QObject):
 
         transport = BleakTransport(address, self._loop)
         try:
-            await transport.connect()
-            device = RadiaCodeBLE(transport, address)
-            await device.initialize()
+            # Don't connect while a scan is in flight — wait for the scanner to
+            # fully stop first (see _ble_lock).
+            async with self._ble_lock:
+                await transport.connect()
+                device = RadiaCodeBLE(transport, address)
+                await device.initialize()
         except Exception as e:
             log.error('[%s] connect failed: %s', address, e)
             self.device_connect_failed.emit(address, str(e))
@@ -231,7 +259,15 @@ class DeviceManager(QObject):
             self.device_disconnected.emit(address)
 
     def _on_ble_disconnect(self, address: str) -> None:
-        """Called from bleak's disconnect callback (asyncio thread)."""
+        """Called from bleak's disconnect callback (asyncio thread).
+
+        End the session cleanly by cancelling the poll task. We do NOT try to
+        auto-reconnect: on Windows, a BLE scan re-initialises the radio and
+        drops active links, so churning connect/disconnect here would just
+        repeatedly disconnect the device — which makes the RadiaCode auto-power
+        off. The user reconnects explicitly instead.
+        """
+        log.warning('[%s] BLE link dropped', address)
         task = self._poll_tasks.get(address)
         if task and not task.done():
             task.cancel()
@@ -243,6 +279,15 @@ class DeviceManager(QObject):
     async def _poll_loop(self, address: str) -> None:
         device = self._devices[address]
         tick = 0
+        consecutive_errors = 0
+
+        # Battery / accumulated dose only arrive in the device's infrequent
+        # RareData packet. We remember the latest values and carry them forward
+        # so every 1 Hz status sample has a battery reading, instead of the
+        # sparse, mostly-empty status log we had before.
+        last_charge   = float('nan')
+        last_dose     = float('nan')
+        last_duration = 0
 
         try:
             while True:
@@ -250,40 +295,87 @@ class DeviceManager(QObject):
                 # log config mid-session takes effect immediately.
                 logger = self._loggers.get(address)
 
-                # --- data_buf (1 Hz) ---
                 try:
-                    items = await device.data_buf()
-                    for item in items:
-                        if isinstance(item, RealTimeData):
-                            # Convert raw R/h → µSv/h once, so every downstream
-                            # consumer (panel, sidebar, time series, logger) is
-                            # consistent.
-                            item.dose_rate *= _DOSE_RATE_TO_USV_H
-                            self.realtime_data.emit(address, item)
-                            if logger:
-                                logger.log_realtime(item)
-                        elif isinstance(item, RareData):
-                            self.rare_data.emit(address, item)
-                            if logger:
-                                logger.log_status(item)
-                except asyncio.CancelledError:
-                    raise
-                except Exception as e:
-                    log.error('[%s] data_buf error: %s', address, e)
-                    raise   # exit poll loop on persistent errors
+                    # Hold the adapter for this read cycle so a scan can't run
+                    # concurrently and drop the link. If a scan is in progress,
+                    # this simply waits until it finishes.
+                    async with self._ble_lock:
+                        # --- data_buf (1 Hz): count/dose rate + battery snapshots ---
+                        items = await device.data_buf()
+                        for item in items:
+                            if isinstance(item, RealTimeData):
+                                # Convert raw R/h → µSv/h once, so every downstream
+                                # consumer (panel, sidebar, time series, logger) is
+                                # consistent.
+                                item.dose_rate *= _DOSE_RATE_TO_USV_H
+                                self.realtime_data.emit(address, item)
+                                if logger:
+                                    logger.log_realtime(item)
+                            elif isinstance(item, RareData):
+                                # Refresh the values we carry forward. Don't log the
+                                # raw packet here — the dense status sample below
+                                # captures it at a consistent cadence.
+                                last_charge   = item.charge_level
+                                last_dose     = item.dose
+                                last_duration = item.duration
 
-                # --- spectrum (every _SPECTRUM_INTERVAL s) ---
-                tick += 1
-                if tick % _SPECTRUM_INTERVAL == 0:
-                    try:
-                        spec = await device.spectrum()
+                        # --- live temperature (register read, 1 Hz) ---
+                        # Poll the TEMP_degC register directly rather than waiting
+                        # for it in the rare buffer packet, so temperature is logged
+                        # at the same rate as the count rate.
+                        try:
+                            temperature = await device.read_temperature()
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as e:
+                            log.debug('[%s] temperature read failed: %s', address, e)
+                            temperature = float('nan')
+
+                        # --- spectrum (every _SPECTRUM_INTERVAL s) ---
+                        tick += 1
+                        spec = None
+                        if tick % _SPECTRUM_INTERVAL == 0:
+                            try:
+                                spec = await device.spectrum()
+                            except asyncio.CancelledError:
+                                raise
+                            except Exception as e:
+                                log.error('[%s] spectrum error: %s', address, e)
+
+                    # --- dense status sample (temperature + battery, 1 Hz) ---
+                    status = RareData(
+                        dt=datetime.datetime.now(),
+                        duration=last_duration,
+                        dose=last_dose,
+                        temperature=temperature,
+                        charge_level=last_charge,
+                        flags=0,
+                    )
+                    self.rare_data.emit(address, status)
+                    if logger:
+                        logger.log_status(status)
+
+                    if spec is not None:
                         self.spectrum_data.emit(address, spec)
                         if logger:
                             logger.log_spectrum(spec)
-                    except asyncio.CancelledError:
+
+                    consecutive_errors = 0
+
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    consecutive_errors += 1
+                    log.warning('[%s] poll error (%d/%d): %s',
+                                address, consecutive_errors,
+                                _MAX_CONSECUTIVE_ERRORS, e)
+                    # Tolerate transient blips, but give up once the link is
+                    # gone or errors persist. Ending the loop lets the user
+                    # reconnect explicitly (no churn that powers the device off).
+                    if (not device._transport.is_connected
+                            or consecutive_errors >= _MAX_CONSECUTIVE_ERRORS):
+                        log.error('[%s] ending poll loop', address)
                         raise
-                    except Exception as e:
-                        log.error('[%s] spectrum error: %s', address, e)
 
                 await asyncio.sleep(1.0)
 
