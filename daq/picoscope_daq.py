@@ -96,6 +96,10 @@ class PicoscopeDAQ:
                 timestamp, dt, adc2mvs, data = daq.acquire_one()
                 daq.write_hdf5(f'run_{i}.hdf5', timestamp, dt, adc2mvs, data)
 
+    For a free-running look at the signal without writing files, use
+    monitor_stream() instead of acquire_one() — same scope session, same channel
+    setup, and it leaves the driver ready for acquire_one() when it returns.
+
     The GUI (daq_gui.py) drives this class from a QThread.
     """
 
@@ -105,6 +109,28 @@ class PicoscopeDAQ:
         self._status: dict = {}
         self._one_buffer: Optional[np.ndarray] = None
         self._connected = False
+        # Diagnostics.  ps4000aGetStreamingLatestValues is the only driver call
+        # whose return code used to be stored and never looked at, and it is the
+        # one that reports the scope having run out of room to put samples — so
+        # data loss during a long monitor was silent by construction.
+        self.connect_status: str = ''
+        self.stream_events: dict = {}
+        self.last_capture_events: dict = {}
+
+    @property
+    def connected(self) -> bool:
+        return self._connected
+
+    @property
+    def stream_health(self) -> str:
+        """Everything the driver complained about while streaming, most frequent first."""
+        if not self.stream_events:
+            return ''
+        return ' · '.join(f'{name} ×{n}' for name, n in
+                          sorted(self.stream_events.items(), key=lambda kv: -kv[1]))
+
+    def reset_stream_events(self) -> None:
+        self.stream_events.clear()
 
     # ── Connection ─────────────────────────────────────────────────────────────
 
@@ -114,8 +140,14 @@ class PicoscopeDAQ:
         status = ps.ps4000aOpenUnit(ctypes.byref(self._chandle), serial_buf)
         self._status['openunit'] = status
 
-        # Power-source fixups: 282 (USB3 on USB2 port) and 286 (no aux power)
-        # are both resolvable by ChangePowerSource.
+        # Power-source fixups.  ChangePowerSource lets the unit open either way,
+        # but neither condition is harmless and the caller should know which one
+        # it got:
+        #   282 PICO_POWER_SUPPLY_NOT_CONNECTED — running on USB power alone
+        #   286 PICO_USB3_0_DEVICE_NON_USB3_0_PORT — USB 3.0 scope on a USB 2.0
+        #       port, which cuts the sustainable streaming rate several-fold and
+        #       will overrun on a fast multi-channel monitor.
+        self.connect_status = PICO_STATUS_LOOKUP.get(status, '') if status else ''
         if status in (282, 286):
             self._status['changePowerSource'] = ps.ps4000aChangePowerSource(
                 self._chandle, status)
@@ -153,32 +185,78 @@ class PicoscopeDAQ:
     def _configure_channels(self) -> None:
         for ch in self.config.channels:
             coupling = 'PS4000A_AC' if ch.coupling == 'AC' else 'PS4000A_DC'
-            key = f'setCh{ch.name}'
-            self._status[key] = ps.ps4000aSetChannel(
-                self._chandle,
-                CHANNEL_DICT[ch.name],
-                1,  # enabled
-                ps.PS4000A_COUPLING[coupling],
-                ch.range_idx,
-                ch.analog_offset,
-            )
-            assert_pico_ok(self._status[key])
+            self._set_channel(ch.name, True, ch.range_idx, coupling, ch.analog_offset)
+
+    def _set_channel(self, name: str, enabled: bool, range_idx: int = 7,
+                     coupling: str = 'PS4000A_DC', analog_offset: float = 0.0) -> None:
+        key = f'setCh{name}'
+        self._status[key] = ps.ps4000aSetChannel(
+            self._chandle,
+            CHANNEL_DICT[name],
+            1 if enabled else 0,
+            ps.PS4000A_COUPLING[coupling],
+            range_idx,
+            analog_offset,
+        )
+        assert_pico_ok(self._status[key])
 
     def _allocate_buffers(self) -> None:
+        """Allocate and register the acquisition buffer (one file's worth of streaming)."""
         n_ch = len(self.config.channels)
         self._one_buffer = np.zeros((n_ch, self.config.buffer_size), dtype=np.int16)
+        self._register_buffers(self._one_buffer)
+
+    def _register_buffers(self, buffer: np.ndarray) -> None:
+        """Point the driver at ``buffer`` (shape (n_channels, n_samples), int16)."""
         for i, ch in enumerate(self.config.channels):
             key = f'setDataBuffers{ch.name}'
             self._status[key] = ps.ps4000aSetDataBuffers(
                 self._chandle,
                 CHANNEL_DICT[ch.name],
-                self._one_buffer[i].ctypes.data_as(ctypes.POINTER(ctypes.c_int16)),
+                buffer[i].ctypes.data_as(ctypes.POINTER(ctypes.c_int16)),
                 None,
-                self.config.buffer_size,
+                buffer.shape[1],
                 0,   # memory_segment
                 ps.PS4000A_RATIO_MODE['PS4000A_RATIO_MODE_NONE'],
             )
             assert_pico_ok(self._status[key])
+
+    def _safe_stop(self) -> None:
+        """Stop streaming, ignoring errors (the scope may already be idle)."""
+        try:
+            ps.ps4000aStop(self._chandle)
+        except Exception:
+            pass
+
+    def reconfigure(self, config: AcquisitionConfig) -> None:
+        """
+        Apply a new configuration to an already-open scope.
+
+        Channels that were enabled but are absent from the new config are
+        explicitly disabled, then the remaining channels are re-set and the
+        acquisition buffers re-allocated.  Any streaming in progress is stopped
+        first, so callers must not be inside acquire_one()/monitor_stream().
+        """
+        if not self._connected:
+            self.config = config
+            return
+        self._safe_stop()
+        previous = {ch.name for ch in self.config.channels}
+        self.config = config
+        current = {ch.name for ch in config.channels}
+        for name in sorted(previous - current):
+            self._set_channel(name, False)
+        self._configure_channels()
+        self._allocate_buffers()
+
+    def _adc2mv_factors(self) -> np.ndarray:
+        """Per-channel mV-per-count scale factors (device constant; safe when idle)."""
+        max_adc = ctypes.c_int16()
+        self._status['maximumValue'] = ps.ps4000aMaximumValue(
+            self._chandle, ctypes.byref(max_adc))
+        assert_pico_ok(self._status['maximumValue'])
+        ranges = np.array([ch.range_idx for ch in self.config.channels])
+        return CHANNEL_INPUT_RANGES_MV[ranges] / max_adc.value
 
     # ── Acquisition ─────────────────────────────────────────────────────────────
 
@@ -216,14 +294,16 @@ class PicoscopeDAQ:
         n_ch = len(cfg.channels)
         total_samples = cfg.buffer_size * cfg.n_buffer
 
+        # Re-assert ownership of the driver buffers: monitor_stream() temporarily
+        # registers its own smaller buffer, and this is cheap and idempotent.
+        if self._one_buffer is None or self._one_buffer.shape != (n_ch, cfg.buffer_size):
+            self._allocate_buffers()
+        else:
+            self._register_buffers(self._one_buffer)
+
         # ps4000aMaximumValue is a device constant — safe to query before streaming.
         # Doing it here lets on_chunk use adc2mvs without waiting for acquisition to end.
-        max_adc = ctypes.c_int16()
-        self._status['maximumValue'] = ps.ps4000aMaximumValue(
-            self._chandle, ctypes.byref(max_adc))
-        assert_pico_ok(self._status['maximumValue'])
-        ranges  = np.array([ch.range_idx for ch in cfg.channels])
-        adc2mvs = CHANNEL_INPUT_RANGES_MV[ranges] / max_adc.value
+        adc2mvs = self._adc2mv_factors()
 
         nominal_dt     = cfg.sample_interval * TIME_UNITS_SEC[cfg.sample_units]
         chunk_every    = max(1, int(chunk_period    / nominal_dt))
@@ -283,22 +363,208 @@ class PicoscopeDAQ:
         )
         assert_pico_ok(self._status['runStreaming'])
 
+        capture_events: dict = {}
         c_func_ptr = ps.StreamingReadyType(_streaming_callback)
         while state['next_sample'] < total_samples and not state['auto_stop']:
             state['was_called_back'] = False
-            self._status['getStreamingLatestValues'] = ps.ps4000aGetStreamingLatestValues(
-                self._chandle, c_func_ptr, None)
+            self._status['getStreamingLatestValues'] = st = (
+                ps.ps4000aGetStreamingLatestValues(self._chandle, c_func_ptr, None))
+            if st != 0:
+                # Recorded files are exposed to exactly the same data loss as the
+                # live monitor, and a file with a hole in it looks entirely normal
+                # on disk — so the count travels with the data (see write_hdf5).
+                name = PICO_STATUS_LOOKUP.get(st, f'status={st}')
+                capture_events[name] = capture_events.get(name, 0) + 1
+                self.stream_events[name] = self.stream_events.get(name, 0) + 1
             if not state['was_called_back']:
                 time.sleep(0.01)
+        self.last_capture_events = capture_events
 
         actual_dt = c_interval.value * TIME_UNITS_SEC[cfg.sample_units]
         return timestamp, actual_dt, adc2mvs, state['total_buffer']
+
+    # ── Free-running monitor (no data saved) ───────────────────────────────────
+
+    def monitor_stream(self, on_window, ring_duration: float = 1.0,
+                       update_period: float = 0.2, chunk_duration: float = 0.05,
+                       should_stop=None, max_ring_samples: int = 2 ** 24,
+                       stall_timeout: float = 5.0) -> None:
+        """
+        Stream continuously without autostop and hand rolling windows to a callback.
+
+        Nothing is written to disk and no full-length buffer is kept: the driver
+        writes into a small chunk buffer (``chunk_duration`` seconds) and the
+        callback copies each chunk into a circular ring holding the most recent
+        ``ring_duration`` seconds.  The polling loop — not the callback — invokes
+        ``on_window`` every ``update_period`` seconds, so slow consumers (PSD,
+        plotting) can never stall the driver callback.
+
+        Parameters
+        ----------
+        on_window : callable
+            ``on_window(get_window, adc2mvs, dt, overflow)``.
+
+            ``get_window(duration=None)`` returns a fresh int16 array of shape
+            (n_channels, n) ordered oldest → newest holding the most recent
+            ``duration`` seconds (everything retained, if omitted).  It is a
+            getter rather than a ready-made array so the consumer can pull a
+            short slice at a high rate and a long one only occasionally —
+            copying a multi-second ring 30 times a second would be pure waste.
+            Valid only for the duration of the call.
+
+            ``dt`` is the nominal sample period and ``overflow`` the OR of the
+            driver's over-range bitmask since the previous call.
+        ring_duration : float
+            Seconds of history retained (clamped to ``max_ring_samples``).
+        update_period : float
+            Wall-clock seconds between ``on_window`` calls.
+        chunk_duration : float
+            Driver callback granularity in seconds.  Smaller = lower latency,
+            more callback overhead.
+        should_stop : callable, optional
+            Polled every loop iteration; monitoring returns as soon as it is true.
+            This makes stopping responsive (unlike acquire_one, which blocks for a
+            whole file), which is what lets the GUI switch modes promptly.
+        max_ring_samples : int
+            Per-channel cap on the ring, so a long window at a high sample rate
+            cannot exhaust memory.
+
+        Returns when ``should_stop()`` becomes true, or early if the driver stops
+        delivering callbacks for ``stall_timeout`` seconds (the caller is expected
+        to simply call again — MonitorWorker's outer loop does).  Either way the
+        scope is left stopped and the acquisition buffers re-registered, ready for
+        acquire_one().
+        """
+        cfg  = self.config
+        n_ch = len(cfg.channels)
+        if n_ch == 0:
+            raise RuntimeError('No channels configured.')
+
+        nominal_dt     = cfg.dt
+        chunk_samples  = int(np.clip(chunk_duration / nominal_dt, 1024, max_ring_samples))
+        window_samples = int(np.clip(ring_duration  / nominal_dt, chunk_samples,
+                                     max_ring_samples))
+
+        adc2mvs = self._adc2mv_factors()
+
+        # Same closure pattern as acquire_one: all mutable streaming state is
+        # captured here rather than in module globals (see daq_dev_notes.txt).
+        mon_buffer = np.zeros((n_ch, chunk_samples), dtype=np.int16)
+        ring       = np.zeros((n_ch, window_samples), dtype=np.int16)
+        state = {
+            'ptr':             0,      # next write position in the ring
+            'filled':          0,      # valid samples in the ring
+            'overflow':        0,
+            'was_called_back': False,
+        }
+
+        def _monitor_callback(handle, noOfSamples, startIndex, overflow,
+                              triggerAt, triggered, autoStop, param):
+            state['was_called_back'] = True
+            if noOfSamples <= 0:
+                return
+            state['overflow'] |= overflow
+            src = mon_buffer[:, startIndex:startIndex + noOfSamples]
+            n   = src.shape[1]
+            if n >= window_samples:
+                ring[:, :] = src[:, -window_samples:]
+                state['ptr']    = 0
+                state['filled'] = window_samples
+                return
+            p   = state['ptr']
+            end = p + n
+            if end <= window_samples:
+                ring[:, p:end] = src
+            else:
+                split = window_samples - p
+                ring[:, p:]           = src[:, :split]
+                ring[:, :n - split]   = src[:, split:]
+            state['ptr']    = end % window_samples
+            state['filled'] = min(window_samples, state['filled'] + n)
+
+        def _snapshot(duration: Optional[float] = None) -> np.ndarray:
+            """
+            Copy out the most recent ``duration`` seconds, oldest → newest.
+
+            Only the requested tail is copied.  When the ring has not wrapped
+            past it the tail is contiguous and this is a single memcpy;
+            otherwise the two pieces are stitched in order.
+            """
+            filled = state['filled']
+            n = filled if duration is None else min(
+                filled, max(1, int(duration / nominal_dt)))
+            end = state['ptr'] if filled >= window_samples else filled
+            start = end - n
+            if start >= 0:
+                return ring[:, start:end].copy()
+            out = np.empty((n_ch, n), dtype=np.int16)
+            head = -start                       # samples living at the ring's tail
+            out[:, :head] = ring[:, window_samples + start:]
+            out[:, head:] = ring[:, :end]
+            return out
+
+        self._register_buffers(mon_buffer)
+        c_interval = ctypes.c_int32(cfg.sample_interval)
+
+        # autoStop=0 → the driver recycles the chunk buffer indefinitely.
+        self._status['runStreamingMonitor'] = ps.ps4000aRunStreaming(
+            self._chandle,
+            ctypes.byref(c_interval),
+            ps.PS4000A_TIME_UNITS[cfg.sample_units],
+            0,               # maxPreTriggerSamples
+            chunk_samples,   # maxPostTriggerSamples (ignored while autoStop is off)
+            0,               # autoStopOn
+            1,               # downsampleRatio
+            ps.PS4000A_RATIO_MODE['PS4000A_RATIO_MODE_NONE'],
+            chunk_samples,
+        )
+        assert_pico_ok(self._status['runStreamingMonitor'])
+        actual_dt = c_interval.value * TIME_UNITS_SEC[cfg.sample_units]
+
+        c_func_ptr  = ps.StreamingReadyType(_monitor_callback)
+        min_samples = max(chunk_samples, int(0.01 / nominal_dt))
+        last_emit   = 0.0
+        last_data   = time.perf_counter()
+        try:
+            while not (should_stop and should_stop()):
+                state['was_called_back'] = False
+                self._status['getStreamingLatestValues'] = st = (
+                    ps.ps4000aGetStreamingLatestValues(self._chandle, c_func_ptr, None))
+                if st != 0:
+                    # PICO_BUFFER_STALL (28) here means the driver had nowhere to
+                    # put samples and threw some away; whatever arrives next is
+                    # discontinuous.  Counting these by name is what turns "the
+                    # trace looks wrong" into a number.
+                    name = PICO_STATUS_LOOKUP.get(st, f'status={st}')
+                    self.stream_events[name] = self.stream_events.get(name, 0) + 1
+                if not state['was_called_back']:
+                    time.sleep(0.005)
+
+                now = time.perf_counter()
+                if state['was_called_back']:
+                    last_data = now
+                elif now - last_data > stall_timeout:
+                    # Driver went quiet (stopped stream, USB hiccup) — bail out and
+                    # let the caller start a fresh streaming run.
+                    return
+                if state['filled'] >= min_samples and now - last_emit >= update_period:
+                    overflow = state['overflow']
+                    state['overflow'] = 0
+                    on_window(_snapshot, adc2mvs, actual_dt, overflow)
+                    last_emit = time.perf_counter()
+        finally:
+            self._safe_stop()
+            # Hand the driver back its acquisition-sized buffers so a mode switch
+            # into acquire_one() needs no extra setup.
+            if self._one_buffer is not None:
+                self._register_buffers(self._one_buffer)
 
     # ── HDF5 writer ─────────────────────────────────────────────────────────────
 
     def write_hdf5(self, filepath: str, timestamp: float, dt: float,
                    adc2mvs: np.ndarray, data: np.ndarray,
-                   pressure_mbar: Optional[float] = None) -> None:
+                   pressure_mbar: Optional[float] = None,
+                   extra_attrs: Optional[dict] = None) -> None:
         """
         Write one capture to HDF5 using the standard lab format.
 
@@ -310,6 +576,10 @@ class PicoscopeDAQ:
             /data/channel_c          int16 dataset  (if save_mean_only is False)
             /data/channel_c.attrs['adc2mv']
             /data.attrs['channel_c_mean_mv']  (if save_mean_only is True)
+
+        ``extra_attrs`` adds further attributes to /data — used to record the
+        calibration-pulse settings in force for the file, so the amplitude does
+        not have to be recovered from the filename.
         """
         with h5py.File(filepath, 'w') as f:
             g = f.create_group('data')
@@ -317,6 +587,16 @@ class PicoscopeDAQ:
             g.attrs['delta_t'] = dt
             if pressure_mbar is not None:
                 g.attrs['pressure_mbar'] = pressure_mbar
+            # Anything the driver reported during the capture this call follows.
+            # A stream the USB link could not keep up with yields a file that is
+            # the right length and looks perfectly normal, with samples missing
+            # in the middle — so the warning has to be recorded at write time or
+            # it cannot be recovered afterwards.
+            if self.last_capture_events:
+                g.attrs['driver_events'] = ', '.join(
+                    f'{name}x{n}' for name, n in sorted(self.last_capture_events.items()))
+            for key, value in (extra_attrs or {}).items():
+                g.attrs[key] = value
             for i, ch in enumerate(self.config.channels):
                 if ch.save_mean_only:
                     g.attrs[f'channel_{ch.name.lower()}_mean_mv'] = (

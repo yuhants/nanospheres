@@ -82,8 +82,16 @@ PLL_BASE_ADDR = [0x41200000, 0x41300000]
 GLOB_BASE_ADDR = 0x41200000
 
 REMOTE_BITFILE = "/tmp/pll_project.bit"
-_LOCAL_BITFILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                              "pll_fpga", "bitfile", "pll_project.bit")
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_LOCAL_BITFILE = os.path.join(_HERE, "pll_fpga", "bitfile", "pll_project.bit")
+
+# Reheating bursts: the timing loop runs *on the board* (see rp_reheat.py).
+_LOCAL_REHEAT_AGENT = os.path.join(_HERE, "rp_reheat.py")
+REMOTE_REHEAT_AGENT = "/tmp/rp_reheat.py"
+REMOTE_REHEAT_LOG = "/tmp/rp_reheat.log"
+REMOTE_REHEAT_PID = "/tmp/rp_reheat.pid"
+REMOTE_REHEAT_OUT = "/tmp/rp_reheat.out"
+EXT_PINS_P_SHIFT = 16                  # ext_pins_p bit i -> register bit 16+i
 
 # Register-field map: name -> (offset, msb, lsb, scope, signed)
 #   scope 'pll'    -> lives at each PLL's base
@@ -165,6 +173,48 @@ def _clamp_unsigned(val, nbits):
     return max(0, min((1 << nbits) - 1, val))
 
 
+def parse_reheat_log(text):
+    """Parse an ``rp_reheat.py`` log into arrays + header (see fetch_reheat_log).
+
+    Module-level so logs saved from a previous run can be re-read without a
+    board connection.
+    """
+    header, rows, warnings = {}, [], []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("#"):
+            body = line[1:].strip()
+            if body.startswith("WARNING"):
+                warnings.append(body)
+                continue
+            tokens = body.split()
+            if tokens and all("=" in tok for tok in tokens):
+                # e.g. "cycles=2000 t_on=0.5 t_off=0.02"
+                for tok in tokens:
+                    k, v = tok.split("=", 1)
+                    header[k] = v
+            elif "=" in body and " " not in body.split("=", 1)[0]:
+                # single key whose value contains spaces, e.g. "status=..."
+                k, v = body.split("=", 1)
+                header[k] = v
+            continue
+        parts = line.split(",")
+        if len(parts) == 4:
+            try:
+                rows.append([float(p) for p in parts])
+            except ValueError:
+                continue
+    arr = (np.array(rows, dtype=float) if rows
+           else np.zeros((0, 4), dtype=float))
+    return {"cycle": arr[:, 0].astype(int), "t_off_start": arr[:, 1],
+            "t_on_start": arr[:, 2], "off_duration": arr[:, 3],
+            "header": header, "warnings": warnings,
+            "status": header.get("status", "unknown"),
+            "completed": int(header.get("completed", "0").split("/")[0] or 0)}
+
+
 # --------------------------------------------------------------------------- #
 # Driver
 # --------------------------------------------------------------------------- #
@@ -195,6 +245,8 @@ class RedPitayaPLL:
         # round-trips). Per PLL.
         self._cache = [dict(a=0.0, phi=0.0, f0=0.0, bw=0.0)
                        for _ in range(n_pll)]
+        # Config of the last reheating burst launched (see start_reheat).
+        self._reheat_cfg = None
 
         if connect:
             self.connect()
@@ -531,6 +583,234 @@ class RedPitayaPLL:
         Ig = ki * I_HZ2_PER_DEG_PER_KI
         with np.errstate(divide="ignore"):
             return P + Ig / (1j * 2 * np.pi * f)
+
+    # ------------------------------------------------------------------ #
+    # Reheating bursts (feedback gated off/on by an on-board agent)
+    # ------------------------------------------------------------------ #
+    #
+    # A reheating measurement wants the parametric drive off for a few tens of
+    # ms, back on, repeated thousands of times. Toggling from here is far too
+    # jittery -- each register access is an SSH round-trip plus a `monitor`
+    # fork on the Zynq (ms, with unbounded tails) -- so the timing loop runs on
+    # the board (rp_reheat.py) and these methods only launch and watch it.
+    #
+    # The gate is the weight register (w_a/w_b): zeroing it kills the drive
+    # while the phase detector and PI loop keep tracking the particle, so the
+    # PLL stays locked through the dark window and resumes in phase. `pid_en`
+    # would do the opposite -- freeze the loop while the output keeps running.
+
+    def gate_addr(self, pll):
+        """Address of the weight register gated during a reheating burst."""
+        return PLL_BASE_ADDR[pll] + PARAM_MAP["w_a"][0]
+
+    def has_python3(self):
+        """True if the board has a python3 the on-board agent can run under."""
+        return self._exec("command -v python3 2>/dev/null || echo NONE"
+                          ).strip() != "NONE"
+
+    def upload_reheat_agent(self, force=False):
+        """SCP rp_reheat.py to the board (skipped if already there, same size)."""
+        if not os.path.isfile(_LOCAL_REHEAT_AGENT):
+            raise FileNotFoundError(
+                f"Reheat agent not found: {_LOCAL_REHEAT_AGENT}")
+        local_size = os.path.getsize(_LOCAL_REHEAT_AGENT)
+        sftp = self.client.open_sftp()
+        try:
+            if not force:
+                try:
+                    if sftp.stat(REMOTE_REHEAT_AGENT).st_size == local_size:
+                        return False
+                except IOError:
+                    pass
+            sftp.put(_LOCAL_REHEAT_AGENT, REMOTE_REHEAT_AGENT)
+        finally:
+            sftp.close()
+        print(f"Uploaded rp_reheat.py -> {REMOTE_REHEAT_AGENT}")
+        return True
+
+    def start_reheat(self, t_off, t_on, cycles, plls=None, marker_bit=0,
+                     marker_active_high=True, settle=1.0, spin=1.5e-3,
+                     realtime=True, allow_zero_drive=False):
+        """Start a reheating burst on the board and return immediately.
+
+        Each cycle cools for ``t_on`` seconds, then switches the drive of every
+        PLL in ``plls`` off for ``t_off`` seconds. Both in **seconds**.
+
+        ``marker_bit`` (0-7, or None to disable) pulses an ``ext_pins_p`` line
+        on the E1 header high for the duration of each dark window -- wire it
+        to a spare DAQ channel and every off-window is timestamped in the same
+        record as the particle motion.
+
+        The board keeps running if the host disconnects; the agent restores the
+        drive on exit, including on SIGTERM (``stop_reheat``).
+
+        Returns a dict describing the launched burst.
+        """
+        if self.reheat_running():
+            raise RuntimeError("A reheating burst is already running "
+                               "(call stop_reheat() first)")
+        if t_off <= 0 or t_on <= 0:
+            raise ValueError("t_off and t_on must be positive")
+        if cycles <= 0:
+            raise ValueError("cycles must be positive")
+        plls = list(range(self.n_pll)) if plls is None else list(plls)
+        if not plls:
+            raise ValueError("no PLLs selected to gate")
+
+        if not allow_zero_drive:
+            dark = [p for p in plls if abs(self.get_param("a", p)) < 0.5]
+            if dark:
+                raise RuntimeError(
+                    f"PLL(s) {dark} have a=0 -- their drive is already off, so "
+                    "the burst would do nothing. Turn the cooling on first "
+                    "(or pass allow_zero_drive=True).")
+
+        if not self.has_python3():
+            raise RuntimeError(
+                "No python3 on the Red Pitaya; the on-board timing agent "
+                "cannot run. Host-side gating would not be accurate enough "
+                "for a reheating measurement.")
+        self.upload_reheat_agent()
+
+        marker_mask = 0
+        if marker_bit is not None:
+            if not 0 <= int(marker_bit) <= 7:
+                raise ValueError("marker_bit must be 0-7 (or None)")
+            marker_mask = 1 << (EXT_PINS_P_SHIFT + int(marker_bit))
+
+        args = [f"--cycles {int(cycles)}", f"--t-on {float(t_on):.9g}",
+                f"--t-off {float(t_off):.9g}", f"--settle {float(settle):.9g}",
+                f"--spin {float(spin):.9g}", f"--log {REMOTE_REHEAT_LOG}"]
+        for pll in plls:
+            args.append(f"--gate 0x{self.gate_addr(pll):08X}")
+        if marker_mask:
+            args.append(f"--marker-addr 0x{GLOB_BASE_ADDR:08X}")
+            args.append(f"--marker-mask 0x{marker_mask:08X}")
+            args.append("--marker-active "
+                        f"{'high' if marker_active_high else 'low'}")
+        if realtime:
+            args.append("--realtime")
+
+        cmd = (f"rm -f {REMOTE_REHEAT_LOG} ; "
+               f"nohup python3 {REMOTE_REHEAT_AGENT} {' '.join(args)} "
+               f"> {REMOTE_REHEAT_OUT} 2>&1 < /dev/null & "
+               f"echo $! > {REMOTE_REHEAT_PID}")
+        self._exec(cmd)
+
+        self._reheat_cfg = dict(t_off=float(t_off), t_on=float(t_on),
+                                cycles=int(cycles), plls=plls,
+                                marker_bit=marker_bit, settle=float(settle),
+                                duration_s=float(settle) +
+                                cycles * (float(t_on) + float(t_off)))
+        time.sleep(0.4)                  # let it get past argument parsing
+        if not self.reheat_running():
+            raise RuntimeError("Reheat agent exited immediately:\n"
+                               + self.reheat_stdout())
+        print(f"Reheat burst started: {cycles} x (on {t_on*1e3:.1f} ms / "
+              f"off {t_off*1e3:.1f} ms) on PLL(s) {plls}, "
+              f"~{self._reheat_cfg['duration_s']:.0f} s")
+        return dict(self._reheat_cfg)
+
+    def reheat_running(self):
+        """True while the on-board burst agent is alive."""
+        out = self._exec(
+            f'if [ -f {REMOTE_REHEAT_PID} ] && '
+            f'kill -0 "$(cat {REMOTE_REHEAT_PID})" 2>/dev/null ; '
+            f'then echo RUNNING ; else echo IDLE ; fi')
+        return out.strip().endswith("RUNNING")
+
+    def reheat_progress(self):
+        """``{'running', 'cycles_done', 'cycles', 'fraction'}`` for a burst."""
+        out = self._exec(
+            f'if [ -f {REMOTE_REHEAT_PID} ] && '
+            f'kill -0 "$(cat {REMOTE_REHEAT_PID})" 2>/dev/null ; '
+            f'then echo RUNNING ; else echo IDLE ; fi ; '
+            f'grep -c "^[0-9]" {REMOTE_REHEAT_LOG} 2>/dev/null || echo 0')
+        lines = [ln for ln in out.splitlines() if ln.strip()]
+        running = bool(lines) and lines[0].strip() == "RUNNING"
+        try:
+            done = int(lines[-1].strip())
+        except (ValueError, IndexError):
+            done = 0
+        cfg = getattr(self, "_reheat_cfg", None) or {}
+        total = cfg.get("cycles", 0)
+        return {"running": running, "cycles_done": done, "cycles": total,
+                "fraction": (done / total) if total else 0.0}
+
+    def stop_reheat(self, timeout=5.0):
+        """Stop a running burst and make sure the drive is back on.
+
+        The agent restores the weights itself on SIGTERM. If it will not die we
+        escalate to SIGKILL -- which could leave the drive zeroed mid-cycle --
+        so the weights are always rewritten from the host's cached a/phi
+        afterwards, and the marker line is cleared.
+        """
+        killed = False
+        if self.reheat_running():
+            self._exec(f'kill -TERM "$(cat {REMOTE_REHEAT_PID})" 2>/dev/null '
+                       f'|| true')
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                if not self.reheat_running():
+                    break
+                time.sleep(0.2)
+            else:
+                self._exec(f'kill -KILL "$(cat {REMOTE_REHEAT_PID})" '
+                           f'2>/dev/null || true')
+                killed = True
+                time.sleep(0.3)
+
+        # Unconditional restore: never leave a sphere with the feedback off.
+        cfg = getattr(self, "_reheat_cfg", None) or {}
+        for pll in cfg.get("plls", range(self.n_pll)):
+            self._set_weights(pll, self._cache[pll]["a"],
+                              self._cache[pll]["phi"])
+        marker_bit = cfg.get("marker_bit", None)
+        if marker_bit is not None:
+            self.sync_all()
+            pins = int(self._get_raw("ext_pins_p", 0)) & ~(1 << int(marker_bit))
+            self.set_param("ext_pins_p", pins, 0)
+        print("Reheat burst stopped; drive restored"
+              + (" (agent had to be SIGKILLed)" if killed else ""))
+        return not killed
+
+    def reheat_stdout(self):
+        """stdout/stderr of the on-board agent (empty unless it crashed)."""
+        try:
+            return self._exec(f"cat {REMOTE_REHEAT_OUT} 2>/dev/null || true")
+        except Exception as exc:
+            return f"(could not read agent output: {exc})"
+
+    def fetch_reheat_log(self, local_path=None):
+        """Download and parse the per-cycle timing log of the last burst.
+
+        Returns ``{'cycle', 't_off_start', 't_on_start', 'off_duration'}`` as
+        arrays (seconds, relative to the burst start), plus ``'header'`` and
+        the agent's ``'status'`` / ``'completed'``. Use ``off_duration`` to cut
+        cycles where the board's scheduler preempted the timing loop.
+        """
+        sftp = self.client.open_sftp()
+        try:
+            with sftp.open(REMOTE_REHEAT_LOG) as fh:
+                text = fh.read().decode("utf-8", "replace")
+        finally:
+            sftp.close()
+        if local_path:
+            with open(local_path, "w") as f:
+                f.write(text)
+            print(f"Saved reheat log to {local_path}")
+        return parse_reheat_log(text)
+
+    def reheat_burst(self, t_off, t_on, cycles, poll=1.0, **kwargs):
+        """Run a burst and block until it finishes, returning the parsed log."""
+        self.start_reheat(t_off, t_on, cycles, **kwargs)
+        try:
+            while self.reheat_running():
+                time.sleep(poll)
+        except KeyboardInterrupt:
+            self.stop_reheat()
+            raise
+        return self.fetch_reheat_log()
 
     # ------------------------------------------------------------------ #
     # Save / load parameter sets

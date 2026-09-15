@@ -17,8 +17,63 @@ charging/             # Charge manipulation and measurement scripts
 utils/                # Shared analysis utilities imported by notebooks
 analysis_notebooks/   # Jupyter notebooks for offline data analysis (date-named)
 calculation/          # Theory/modelling notebooks
+lab_gui/              # Single-page PyQt5 GUI for routine tasks (E field, HV, pulses)
 archived/             # Deprecated code
 ```
+
+## Lab task GUI (`lab_gui/`)
+
+`python lab_gui/lab_gui.py` — one window, one page, a foldable section per
+routine task, replacing the edit-the-top-and-run scripts
+(`control/charge_measurement.py`, `control/apply_hv.py`). Structure:
+
+- `task_panel.py` — `TaskPanel` base class (`is_active` / `status_text` / `stop` /
+  `shutdown` / `to_dict` / `from_dict`), plus the shared `ConnectionBar`,
+  `AutoOffBox` and `SectionFrame` widgets
+- `panels/` — one module per task
+- `registry.py` — `PANEL_SPECS` (module, class, column, enabled, collapsed):
+  adding a task is a new panel module and one line here. Panels import lazily;
+  a missing driver becomes an "unavailable" section rather than a GUI that will
+  not start.
+- `layout.json` (optional, per machine, written by the Sections menu) — overrides
+  column count and any section's column/enabled/collapsed
+
+The window owns the shared log, the "All outputs OFF" button (also Escape), the
+"●" active marker on each section heading, and presets covering every section in
+one JSON.
+
+## Trap monitor GUI (`camera/`)
+
+`python camera/trap_monitor_gui.py [--mock]` — Thorlabs camera view with
+auto-capture/classification of trapped spheres. Two tabs:
+
+- **Trap monitor** — camera, detection ROI, backscatter RMS, pressure, capture
+  library (one HDF5, `captures/` + `loadings/` groups).
+- **Laser stabilization** and **Homodyne phase lock** (`camera/laser_stab.py`)
+  — two PI locks on ONE Red Pitaya via PyRPL (`RedPitayaPyRPL`, FPGA `pidN`
+  modules) sharing a single connection (`SharedLink`; a second PyRPL client
+  to the same board breaks the first). `PiLock` holds the lock logic,
+  `PiLockPanel` the generic tab (scrollable controls, live strip chart,
+  calibration sweep → setpoint crossing / start voltage / gain sign).
+  - Laser (`LaserStabPanel`, pid0: photodiode in1 → out1 → HV amp → EOM → PBS)
+    adds **Drop particle**: freeze gains, hold output at the extinction
+    voltage for a dwell, restore `ival` then gains. The drop controls
+    (`LaserStabPanel.drop_group`, built with `embed_drop=False`) are placed
+    under the live camera view on the Trap monitor tab, where the operator
+    decides; drops are recorded on the current loading session (`n_drops`,
+    `drops` JSON attrs).
+  - Homodyne (`HomodynePanel`, pid1: homodyne in2 → out2 → fiber stretcher)
+    adds rail auto-reset: near Vmin/Vmax the integrator jumps by one fringe
+    (V_2π, measurable from the sweep) or to the centre, so the lock re-acquires.
+  Settings persist in `camera/laser_stab_settings.json` (gitignored, keys
+  `link`/`laser`/`homodyne`). `MockBackend` simulates both plants for `--mock`.
+  Connecting with "Reload FPGA" replaces the board's running app
+  (e.g. Oscilloscope+Lock-in+PID) and zeroes every PID output, dropping a
+  trapped particle. `link.fpga_loaded` in the settings file remembers that
+  the bitstream is on the board, so after a PC reboot the default is to
+  reconnect without reloading, a reload asks for confirmation, and a lock
+  found running is adopted (settings read from the registers, nothing
+  written). All PyRPL access stays on the GUI thread.
 
 ## Hardware drivers (`control/src/`)
 

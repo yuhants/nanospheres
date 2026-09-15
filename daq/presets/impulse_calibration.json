@@ -1,0 +1,120 @@
+{
+  "picoscope": "Cloud  (JO279/0118)",
+  "channels": {
+    "A": {
+      "enabled": true,
+      "range_idx": 7,
+      "coupling": "DC",
+      "save_mode": "Full"
+    },
+    "B": {
+      "enabled": true,
+      "range_idx": 7,
+      "coupling": "DC",
+      "save_mode": "Full"
+    },
+    "C": {
+      "enabled": true,
+      "range_idx": 7,
+      "coupling": "DC",
+      "save_mode": "Full"
+    },
+    "D": {
+      "enabled": true,
+      "range_idx": 6,
+      "coupling": "DC",
+      "save_mode": "Full"
+    },
+    "E": {
+      "enabled": false,
+      "range_idx": 7,
+      "coupling": "DC",
+      "save_mode": "Full"
+    },
+    "F": {
+      "enabled": true,
+      "range_idx": 7,
+      "coupling": "DC",
+      "save_mode": "Full"
+    },
+    "G": {
+      "enabled": true,
+      "range_idx": 10,
+      "coupling": "DC",
+      "save_mode": "Full"
+    },
+    "H": {
+      "enabled": false,
+      "range_idx": 7,
+      "coupling": "DC",
+      "save_mode": "Full"
+    }
+  },
+  "sample_interval": 200,
+  "sample_units": "PS4000A_NS",
+  "buffer_size": "33554432",
+  "n_files": 40,
+  "idx_start": 0,
+  "file_directory": "E:/3d_impulse/sphere_20260803/20260804_m47e_4e-7mbar",
+  "file_prefix": "20260804_abcdfg_leftrods_",
+  "read_pressure": true,
+  "pressure_port": "COM7",
+  "rate_unit": "MS/s",
+  "refresh": 0.05,
+  "time_per_div": 0.05,
+  "n_div_x": 10,
+  "psd_span": 0.2,
+  "stream_chunk": 0.05,
+  "nperseg": "auto",
+  "psd_average": 4,
+  "psd_live": true,
+  "psd_live_record": false,
+  "psd_refresh": 0.3,
+  "roll_mode": true,
+  "history_depth": 200,
+  "psd_detrend": true,
+  "resume_monitor": true,
+  "trace_points": 4000,
+  "psd_points": 3000,
+  "envelope": true,
+  "ylim_mode": "auto",
+  "y_min": "-1000",
+  "y_max": "1000",
+  "mv_per_div": 500.0,
+  "n_div_y": 8,
+  "grid_divs": true,
+  "psd_logx": false,
+  "f_min": "",
+  "f_max": "",
+  "psd_ymin": "",
+  "psd_ymax": "",
+  "show_peak": false,
+  "show_rms": true,
+  "pulse": {
+    "port": "COM9",
+    "baudrate": "38400",
+    "channel": 1,
+    "amplitude": 2.5,
+    "width": [
+      500.0,
+      "ns"
+    ],
+    "period": [
+      150.0,
+      "ms"
+    ],
+    "delay": [
+      0.0,
+      "ns"
+    ],
+    "polarity": "NORM",
+    "output_mode": "leave as is",
+    "amplitudes": "5, 10, 15, 20",
+    "sequence_enabled": true,
+    "files_per_amplitude": 10,
+    "output_off_between": true,
+    "cycle": false,
+    "tag_filenames": true,
+    "restart_index": true
+  }
+}

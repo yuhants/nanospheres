@@ -10,8 +10,9 @@ no Vivado/FPGA work is needed to use it.
 
 | File | Purpose |
 |------|---------|
-| `pll_control.py` | `RedPitayaPLL` driver — SSH/`monitor` register access, all unit conversions, live signals, save/load. Headless-usable. |
-| `pll_gui.py`     | PyQt5 + pyqtgraph GUI: all parameters + live lock monitor + loop-design Bode. `--mock` runs with no hardware. |
+| `pll_control.py` | `RedPitayaPLL` driver — SSH/`monitor` register access, all unit conversions, live signals, reheating bursts, save/load. Headless-usable. |
+| `pll_gui.py`     | PyQt5 + pyqtgraph GUI: all parameters + live lock monitor + loop-design Bode + reheating bursts. `--mock` runs with no hardware. |
+| `rp_reheat.py`   | **Runs on the Red Pitaya**, not the lab PC. Uploaded automatically; does the on-board off/on gating loop for reheating measurements. |
 | `pll_fpga/`      | Vendored FPGA design (bitstream + VHDL/Tcl + register doc). Lets the GUI load the FPGA, and keeps the option of *modifying* it open (see its README). |
 
 This is independent of `pyrpl_control.py` / `redpitaya_control.py`. The PLL
@@ -56,6 +57,67 @@ others or the UI. The tab label shows a ● (connected) / ○ (disconnected) dot
   numeric readout, and an output-vector display of (a, φ) in the w_a/w_b plane.
 - **Loop design:** instant Bode of the phase-detector low-pass (alpha/order) and
   the PI filter (kp/ki) so you can tune without poking hardware blindly.
+- **Reheat burst:** gate the drive off for ~10s of ms and back on, repeated as
+  many times as you like, for reheating measurements (below).
+
+## Reheating measurements
+
+The **Reheat burst** tab (or `start_reheat()` from a script) cycles the cooling
+drive off and on: cool for `t_on`, go dark for `t_off`, repeat `cycles` times.
+Set the two times in ms, tick which PLLs to gate, press **Start burst**.
+
+**What is actually switched.** The gate is the output weight register
+(`w_a`/`w_b`, one register per PLL). Zeroing it kills the drive but leaves the
+phase detector and PI loop running on the ADC input, so the PLL **stays locked
+to the particle through the dark window** and resumes with the correct phase —
+which is what keeps the sphere from being lost over thousands of repeats.
+(`pid_en=0` does the opposite: it freezes the loop while the output keeps
+running, so it is *not* a way to turn the feedback off.)
+
+**Why an on-board agent.** Toggling registers from the lab PC is far too
+jittery for this: every access is an SSH round-trip plus a `monitor` process
+fork on the Zynq — several ms typically, with tens-of-ms tails that cannot be
+bounded. So the timing loop runs on the board (`rp_reheat.py`, uploaded to
+`/tmp` on first use): a register write becomes an mmap store, edges are
+scheduled against absolute deadlines so the period does not drift, each edge is
+approached by sleeping to within `spin` (default 1.5 ms) and then busy-waiting,
+and the loop asks for `SCHED_FIFO`. Measured off-window scatter is well under
+0.1 ms.
+
+**Marking the dark windows in your data.** Tick the marker box to pulse an
+`ext_pins_p` bit on the E1 digital header high for the duration of every off
+window (bit *i* → `DIO`*i*`_P`, 3.3 V). Record it on a spare DAQ channel and
+every dark window is timestamped in the same file as the particle motion —
+much better than trying to align against host clocks. (The E1 pins are
+outputs-only in this bitstream, so the Red Pitaya cannot be triggered
+*externally* without an FPGA rebuild — it has to be the one issuing the gate.)
+
+**Verifying the timing.** The agent logs the achieved edge times for every
+cycle. The GUI fetches the log automatically when a burst ends and plots the
+realised off-window per cycle, with mean/std and a count of cycles more than
+1 ms off target — cut those in analysis rather than letting them smear the
+statistics.
+
+**Safety.** The agent restores the weights on normal exit, on error and on
+SIGTERM; `stop_reheat()` also rewrites them from the host afterwards, so the
+drive is never left off. The burst runs under `nohup`, so it survives the GUI
+closing or the network dropping — reconnect and the GUI picks the burst back up.
+
+From a script, alongside your Picoscope acquisition:
+
+```python
+rp = RedPitayaPLL('192.168.1.9')
+rp.start_reheat(t_off=20e-3, t_on=0.5, cycles=2000, plls=[0], marker_bit=0)
+...                                      # take data while it cycles
+print(rp.reheat_progress())              # {'running': True, 'cycles_done': 812, …}
+log = rp.fetch_reheat_log('reheat_timing.log')
+print(log['off_duration'].mean(), log['off_duration'].std())
+rp.stop_reheat()                         # early abort; restores the drive
+```
+
+`reheat_burst(t_off, t_on, cycles)` is the blocking version (starts, waits,
+returns the parsed log). Both `t_off` and `t_on` are in **seconds** in the API,
+milliseconds in the GUI.
 
 ## Use the driver from a script / notebook
 

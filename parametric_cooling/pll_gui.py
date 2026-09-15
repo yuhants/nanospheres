@@ -47,7 +47,8 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QGroupBox, QLabel, QLineEdit, QPushButton, QCheckBox, QComboBox,
     QDoubleSpinBox, QSpinBox, QMessageBox, QSplitter, QFrame, QTabWidget,
-    QScrollArea, QFileDialog, QInputDialog, QToolBar, QAction,
+    QScrollArea, QFileDialog, QInputDialog, QToolBar, QAction, QProgressBar,
+    QFormLayout,
 )
 from PyQt5.QtCore import Qt, QThread, QObject, QTimer, pyqtSignal, pyqtSlot
 from PyQt5.QtGui import QColor
@@ -59,6 +60,7 @@ import pll_control as P  # noqa: E402
 _PLL_COLORS = ["#00e5ff", "#feca57"]   # per-PLL trace colour
 _HISTORY = 600                         # samples kept in rolling plots
 _POLL_MS = 120                         # nominal monitor poll period
+_REHEAT_POLL_MS = 1000                 # reheat-burst progress poll period
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -74,6 +76,7 @@ class MockPLL:
         self._p = [dict(P.COOLING_PRESET) for _ in range(n_pll)]
         for i, d in enumerate(self._p):
             d["f0"] = 130e3 + i * 20e3
+        self._burst = None
         print("MockPLL: synthetic backend (no hardware).")
 
     # connection no-ops
@@ -136,6 +139,53 @@ class MockPLL:
                         "err_deg": err}
         return out
 
+    # reheating bursts -- replayed from the wall clock, no timing loop
+    def start_reheat(self, t_off, t_on, cycles, **kw):
+        self._burst = dict(t_off=float(t_off), t_on=float(t_on),
+                           cycles=int(cycles), plls=kw.get("plls") or [0],
+                           marker_bit=kw.get("marker_bit", 0),
+                           settle=float(kw.get("settle", 1.0)), t0=time.time())
+        self._burst["duration_s"] = (self._burst["settle"] +
+                                     cycles * (t_on + t_off))
+        print(f"[mock] reheat burst: {cycles} cycles")
+        return dict(self._burst)
+
+    def _mock_cycles_done(self):
+        b = self._burst
+        if b is None:
+            return 0
+        elapsed = time.time() - b["t0"] - b["settle"]
+        period = b["t_on"] + b["t_off"]
+        return int(max(0, min(b["cycles"], elapsed // period)))
+
+    def reheat_running(self):
+        return (self._burst is not None and
+                self._mock_cycles_done() < self._burst["cycles"])
+
+    def reheat_progress(self):
+        done = self._mock_cycles_done()
+        total = self._burst["cycles"] if self._burst else 0
+        return {"running": self.reheat_running(), "cycles_done": done,
+                "cycles": total, "fraction": done / total if total else 0.0}
+
+    def stop_reheat(self, timeout=5.0):
+        if self._burst is not None:
+            self._burst["cycles"] = self._mock_cycles_done()
+        print("[mock] reheat stopped")
+        return True
+
+    def fetch_reheat_log(self, local_path=None):
+        b = self._burst or {"t_off": 0.02, "t_on": 0.5, "cycles": 0,
+                            "settle": 1.0}
+        n = self._mock_cycles_done()
+        cycle = np.arange(n)
+        period = b["t_on"] + b["t_off"]
+        t_off = b["settle"] + cycle * period + b["t_on"]
+        dur = b["t_off"] + np.random.randn(n) * 30e-6
+        return {"cycle": cycle, "t_off_start": t_off, "t_on_start": t_off + dur,
+                "off_duration": dur, "header": {"scheduling": "mock"},
+                "warnings": [], "status": "done", "completed": n}
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SSH worker — owns one board's driver, runs on its own thread
@@ -144,6 +194,8 @@ class SSHWorker(QObject):
     connected = pyqtSignal(bool, int, str)   # ok, n_pll, message
     snapshot = pyqtSignal(object)            # all_params() dict
     monitors = pyqtSignal(object)            # read_monitors() dict
+    reheat_state = pyqtSignal(object)        # reheat_progress() dict
+    reheat_log = pyqtSignal(object)          # fetch_reheat_log() dict
     message = pyqtSignal(str)
     error = pyqtSignal(str)
 
@@ -243,6 +295,55 @@ class SSHWorker(QObject):
             self.monitors.emit(self.rp.read_monitors())
         except Exception as exc:
             self.error.emit(f"Monitor read failed: {exc}")
+
+    # ── reheating bursts ────────────────────────────────────────────────────
+    @pyqtSlot(object)
+    def do_reheat_start(self, cfg):
+        if self.rp is None:
+            return
+        try:
+            info = self.rp.start_reheat(**cfg)
+            self.message.emit(
+                f"Reheat burst running: {info['cycles']} cycles, "
+                f"~{info['duration_s']:.0f} s")
+            self.reheat_state.emit(self.rp.reheat_progress())
+        except Exception as exc:
+            self.error.emit(f"Reheat start failed: {exc}")
+            self.reheat_state.emit({"running": False, "cycles_done": 0,
+                                    "cycles": 0, "fraction": 0.0})
+
+    @pyqtSlot()
+    def do_reheat_stop(self):
+        if self.rp is None:
+            return
+        try:
+            self.rp.stop_reheat()
+            self.message.emit("Reheat burst stopped; drive restored")
+        except Exception as exc:
+            self.error.emit(f"Reheat stop failed: {exc}")
+        try:
+            self.reheat_state.emit(self.rp.reheat_progress())
+            self.snapshot.emit(self.rp.all_params())
+        except Exception:
+            pass
+
+    @pyqtSlot()
+    def do_reheat_poll(self):
+        if self.rp is None:
+            return
+        try:
+            self.reheat_state.emit(self.rp.reheat_progress())
+        except Exception as exc:
+            self.error.emit(f"Reheat poll failed: {exc}")
+
+    @pyqtSlot(str)
+    def do_reheat_fetch(self, fn):
+        if self.rp is None:
+            return
+        try:
+            self.reheat_log.emit(self.rp.fetch_reheat_log(fn or None))
+        except Exception as exc:
+            self.error.emit(f"Reheat log fetch failed: {exc}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -345,6 +446,191 @@ class PllPanel(QGroupBox):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Reheating-burst panel
+# ─────────────────────────────────────────────────────────────────────────────
+class ReheatPanel(QWidget):
+    """Gate the cooling drive off and on, many times, for reheating runs.
+
+    The cycling itself happens on the board (``rp_reheat.py``) -- this panel
+    only launches it, shows progress, and plots the achieved off-window
+    durations afterwards so cycles the board's scheduler disturbed can be
+    spotted (and cut in analysis).
+    """
+
+    start_requested = pyqtSignal(object)   # kwargs for start_reheat()
+    stop_requested = pyqtSignal()
+    fetch_requested = pyqtSignal(str)      # local filename ('' = don't save)
+
+    def __init__(self, n_pll):
+        super().__init__()
+        self._n_pll = n_pll
+        self._running = False
+        self._build()
+
+    def _build(self):
+        root = QHBoxLayout(self)
+
+        box = QGroupBox("Burst")
+        form = QFormLayout(box)
+        self.t_on = _dspin(0.1, 600000, 500.0, dec=2, step=10, suffix=" ms")
+        self.t_off = _dspin(0.1, 10000, 20.0, dec=2, step=1, suffix=" ms")
+        self.cycles = QSpinBox(); self.cycles.setRange(1, 1000000)
+        self.cycles.setValue(1000)
+        form.addRow("Feedback ON (cool):", self.t_on)
+        form.addRow("Feedback OFF (dark):", self.t_off)
+        form.addRow("Cycles:", self.cycles)
+
+        self.pll_checks = []
+        pll_row = QHBoxLayout()
+        for pll in range(self._n_pll):
+            cb = QCheckBox(f"PLL{pll}")
+            cb.setChecked(pll == 0)
+            self.pll_checks.append(cb)
+            pll_row.addWidget(cb)
+        pll_row.addStretch()
+        wrap = QWidget(); wrap.setLayout(pll_row)
+        form.addRow("Gate:", wrap)
+
+        marker_row = QHBoxLayout()
+        self.marker_on = QCheckBox("ext_pins_p bit")
+        self.marker_on.setChecked(True)
+        self.marker_bit = QSpinBox(); self.marker_bit.setRange(0, 7)
+        marker_row.addWidget(self.marker_on)
+        marker_row.addWidget(self.marker_bit)
+        marker_row.addStretch()
+        mwrap = QWidget(); mwrap.setLayout(marker_row)
+        mwrap.setToolTip("Digital marker on the E1 header, high while the "
+                         "feedback is off — record it on a spare DAQ channel "
+                         "to timestamp every dark window.")
+        form.addRow("Marker:", mwrap)
+
+        self.settle = _dspin(0, 60, 1.0, dec=2, step=0.5, suffix=" s")
+        self.spin_ms = _dspin(0.1, 20, 1.5, dec=2, step=0.5, suffix=" ms")
+        self.spin_ms.setToolTip("Busy-wait window before each edge. Larger = "
+                                "sharper edges, more CPU on the board.")
+        self.realtime = QCheckBox("SCHED_FIFO on the board")
+        self.realtime.setChecked(True)
+        form.addRow("Settle first:", self.settle)
+        form.addRow("Busy-wait:", self.spin_ms)
+        form.addRow("", self.realtime)
+
+        self.duration_lbl = QLabel("")
+        form.addRow("Total:", self.duration_lbl)
+
+        btns = QHBoxLayout()
+        self.start_btn = QPushButton("Start burst")
+        self.stop_btn = QPushButton("Stop")
+        self.stop_btn.setEnabled(False)
+        self.start_btn.clicked.connect(self._on_start)
+        self.stop_btn.clicked.connect(self.stop_requested.emit)
+        btns.addWidget(self.start_btn); btns.addWidget(self.stop_btn)
+        form.addRow(btns)
+
+        self.progress = QProgressBar(); self.progress.setRange(0, 100)
+        self.progress_lbl = QLabel("idle")
+        form.addRow(self.progress)
+        form.addRow(self.progress_lbl)
+
+        fetch = QHBoxLayout()
+        self.fetch_btn = QPushButton("Fetch timing log")
+        self.save_btn = QPushButton("Fetch + save…")
+        self.fetch_btn.clicked.connect(lambda: self.fetch_requested.emit(""))
+        self.save_btn.clicked.connect(self._on_save)
+        fetch.addWidget(self.fetch_btn); fetch.addWidget(self.save_btn)
+        form.addRow(fetch)
+
+        box.setMaximumWidth(340)
+        root.addWidget(box)
+
+        right = QVBoxLayout()
+        self.plot = pg.PlotWidget(); self.plot.setBackground("#1a1a1a")
+        self.plot.setLabel("left", "Achieved OFF window", units="s")
+        self.plot.setLabel("bottom", "Cycle")
+        self.plot.showGrid(x=True, y=True, alpha=0.3)
+        self.curve = self.plot.plot(pen=None, symbol="o", symbolSize=3,
+                                    symbolBrush="#00e5ff", symbolPen=None)
+        self.target_line = pg.InfiniteLine(angle=0, pen=pg.mkPen(
+            "#feca57", style=Qt.DashLine))
+        self.plot.addItem(self.target_line)
+        right.addWidget(self.plot, 1)
+        self.stats_lbl = QLabel("No timing log fetched yet.")
+        self.stats_lbl.setStyleSheet("font-family:monospace; color:#e0e0e0;")
+        right.addWidget(self.stats_lbl)
+        root.addLayout(right, 1)
+
+        for w in (self.t_on, self.t_off):
+            w.valueChanged.connect(self._update_duration)
+        self.cycles.valueChanged.connect(self._update_duration)
+        self.settle.valueChanged.connect(self._update_duration)
+        self._update_duration()
+
+    # ── helpers ─────────────────────────────────────────────────────────────
+    def _update_duration(self):
+        total = (self.settle.value() +
+                 self.cycles.value() *
+                 (self.t_on.value() + self.t_off.value()) * 1e-3)
+        self.duration_lbl.setText(f"{total:.1f} s  ({total/60:.1f} min)")
+
+    def config(self):
+        plls = [i for i, cb in enumerate(self.pll_checks) if cb.isChecked()]
+        return dict(t_off=self.t_off.value() * 1e-3,
+                    t_on=self.t_on.value() * 1e-3,
+                    cycles=int(self.cycles.value()),
+                    plls=plls,
+                    marker_bit=(int(self.marker_bit.value())
+                                if self.marker_on.isChecked() else None),
+                    settle=self.settle.value(),
+                    spin=self.spin_ms.value() * 1e-3,
+                    realtime=self.realtime.isChecked())
+
+    def _on_start(self):
+        cfg = self.config()
+        if not cfg["plls"]:
+            QMessageBox.warning(self, "Reheat burst",
+                                "Select at least one PLL to gate.")
+            return
+        self.target_line.setValue(cfg["t_off"])
+        self.start_requested.emit(cfg)
+
+    def _on_save(self):
+        fn, _ = QFileDialog.getSaveFileName(self, "Save reheat timing log",
+                                            "reheat_timing.log", "Log (*.log)")
+        if fn:
+            self.fetch_requested.emit(fn)
+
+    # ── state from the worker ───────────────────────────────────────────────
+    def set_running(self, running, done=0, total=0):
+        self._running = running
+        self.start_btn.setEnabled(not running)
+        self.stop_btn.setEnabled(running)
+        if total:
+            self.progress.setValue(int(100 * done / total))
+        if running:
+            self.progress_lbl.setText(f"running — cycle {done}/{total}")
+        elif total:
+            self.progress_lbl.setText(f"finished — {done}/{total} cycles")
+        else:
+            self.progress_lbl.setText("idle")
+
+    def show_log(self, log):
+        dur = np.asarray(log["off_duration"], dtype=float)
+        self.curve.setData(np.asarray(log["cycle"], dtype=float), dur)
+        if dur.size:
+            target = self.target_line.value() or float(np.median(dur))
+            excess_ms = (dur - target) * 1e3
+            self.stats_lbl.setText(
+                f"n = {dur.size}   status: {log['status']}\n"
+                f"OFF window: mean {dur.mean()*1e3:.3f} ms   "
+                f"std {dur.std()*1e3:.3f} ms\n"
+                f"deviation from target: max {np.abs(excess_ms).max():.3f} ms   "
+                f"|dev| > 1 ms in {int((np.abs(excess_ms) > 1).sum())} cycles")
+        else:
+            self.stats_lbl.setText(f"Empty log (status: {log['status']}).")
+        for warning in log.get("warnings", []):
+            self.stats_lbl.setText(self.stats_lbl.text() + f"\n⚠ {warning}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # One board (connection + controls + plots + its own worker thread)
 # ─────────────────────────────────────────────────────────────────────────────
 class BoardWidget(QWidget):
@@ -358,6 +644,10 @@ class BoardWidget(QWidget):
     req_save = pyqtSignal(str)
     req_load = pyqtSignal(str)
     req_poll = pyqtSignal()
+    req_reheat_start = pyqtSignal(object)
+    req_reheat_stop = pyqtSignal()
+    req_reheat_poll = pyqtSignal()
+    req_reheat_fetch = pyqtSignal(str)
 
     # -> container: ask it to refresh this board's tab label/colour
     tab_dirty = pyqtSignal(object)
@@ -381,6 +671,12 @@ class BoardWidget(QWidget):
         self._poll_timer.setSingleShot(True)
         self._poll_timer.timeout.connect(self.req_poll.emit)
 
+        # Reheat progress is polled far more slowly than the lock monitor.
+        self._reheat_timer = QTimer(self)
+        self._reheat_timer.setSingleShot(True)
+        self._reheat_timer.timeout.connect(self.req_reheat_poll.emit)
+        self._reheat_was_running = False
+
     # ── public helpers for the container ────────────────────────────────────
     def host(self):
         return self._host_edit.text().strip() or "(no host)"
@@ -391,6 +687,7 @@ class BoardWidget(QWidget):
     def shutdown(self):
         """Stop polling, disconnect, and tear down the worker thread."""
         self._poll_timer.stop()
+        self._reheat_timer.stop()
         try:
             self.req_disconnect.emit()
             self._thread.quit()
@@ -412,9 +709,15 @@ class BoardWidget(QWidget):
         self.req_save.connect(self._worker.do_save)
         self.req_load.connect(self._worker.do_load)
         self.req_poll.connect(self._worker.do_poll)
+        self.req_reheat_start.connect(self._worker.do_reheat_start)
+        self.req_reheat_stop.connect(self._worker.do_reheat_stop)
+        self.req_reheat_poll.connect(self._worker.do_reheat_poll)
+        self.req_reheat_fetch.connect(self._worker.do_reheat_fetch)
         self._worker.connected.connect(self._on_connected)
         self._worker.snapshot.connect(self._on_snapshot)
         self._worker.monitors.connect(self._on_monitors)
+        self._worker.reheat_state.connect(self._on_reheat_state)
+        self._worker.reheat_log.connect(self._on_reheat_log)
         self._worker.message.connect(self._set_status)
         self._worker.error.connect(self._on_error)
         self._thread.start()
@@ -510,7 +813,15 @@ class BoardWidget(QWidget):
         self._tabs = QTabWidget()
         self._tabs.addTab(self._build_monitor_tab(), "Lock monitor")
         self._tabs.addTab(self._build_bode_tab(), "Loop design (Bode)")
+        self._tabs.addTab(self._build_reheat_tab(), "Reheat burst")
         return self._tabs
+
+    def _build_reheat_tab(self):
+        self._reheat = ReheatPanel(self._n_pll)
+        self._reheat.start_requested.connect(self._on_reheat_start)
+        self._reheat.stop_requested.connect(self.req_reheat_stop.emit)
+        self._reheat.fetch_requested.connect(self.req_reheat_fetch.emit)
+        return self._reheat
 
     def _build_monitor_tab(self):
         w = QWidget(); hl = QHBoxLayout(w)
@@ -598,11 +909,21 @@ class BoardWidget(QWidget):
     def _set_controls_enabled(self, on):
         for p in self._panels:
             p.setEnabled(on)
+        self._reheat.setEnabled(on)
 
     # ── connection handlers ──────────────────────────────────────────────────
     def _on_connect_clicked(self):
         if self._connected:
             self._poll_timer.stop()
+            self._reheat_timer.stop()
+            if self._reheat_was_running:
+                QMessageBox.information(
+                    self, "Reheat burst",
+                    "A reheating burst is still cycling on the board. It runs "
+                    "independently of this GUI and restores the drive when it "
+                    "finishes; reconnect to watch or stop it.")
+                self._reheat_was_running = False
+            self._reheat.set_running(False)
             self.req_disconnect.emit()
             self._connected = False
             self._connect_btn.setText("Connect")
@@ -636,6 +957,8 @@ class BoardWidget(QWidget):
         self._t0 = time.time()
         self._update_bode()
         self._poll_timer.start(_POLL_MS)
+        # A burst launched earlier may still be cycling on the board.
+        self.req_reheat_poll.emit()
         self.tab_dirty.emit(self)
 
     @pyqtSlot(object)
@@ -673,6 +996,32 @@ class BoardWidget(QWidget):
         self._readout.setText("\n".join(lines))
         if self._connected:
             self._poll_timer.start(_POLL_MS)
+
+    # ── reheating bursts ─────────────────────────────────────────────────────
+    def _on_reheat_start(self, cfg):
+        if not self._connected:
+            return
+        self._reheat.set_running(True, 0, cfg["cycles"])
+        self.req_reheat_start.emit(cfg)
+
+    @pyqtSlot(object)
+    def _on_reheat_state(self, state):
+        running = bool(state.get("running"))
+        self._reheat.set_running(running, state.get("cycles_done", 0),
+                                 state.get("cycles", 0))
+        if running:
+            self._reheat_timer.start(_REHEAT_POLL_MS)
+        elif self._reheat_was_running:
+            # Burst just finished -- pull the timing log without being asked.
+            self._set_status("Reheat burst finished; fetching timing log…")
+            self.req_reheat_fetch.emit("")
+        self._reheat_was_running = running
+
+    @pyqtSlot(object)
+    def _on_reheat_log(self, log):
+        self._reheat.show_log(log)
+        self._set_status(f"Reheat log: {log['completed']} cycles "
+                         f"({log['status']})")
 
     @pyqtSlot(str)
     def _on_error(self, msg):

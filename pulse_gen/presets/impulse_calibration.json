@@ -1,0 +1,19 @@
+{
+  "port": "COM9",
+  "baudrate": "38400",
+  "channel": 1,
+  "amplitude": 2.5,
+  "width": [200.0, "ns"],
+  "period": [150.0, "ms"],
+  "delay": [0.0, "ns"],
+  "polarity": "NORM",
+  "output_mode": "leave as is",
+  "amplitudes": "2.5, 5, 7.5, 10, 12.5, 15, 17.5, 20",
+  "dwell": 35.0,
+  "dwell_mode": "seconds",
+  "gap": 0.0,
+  "repeats": 1,
+  "off_between": true,
+  "read_pressure": true,
+  "pressure_port": "COM7"
+}

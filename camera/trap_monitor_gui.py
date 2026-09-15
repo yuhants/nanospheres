@@ -16,6 +16,10 @@ on the session.  This makes the capture rate per loading recoverable —
 "Export all…" writes a loadings_index.csv with per-session capture
 counts broken down by class.
 
+Sphere finding is confined to a region of interest: nothing is analysed and
+monitoring cannot start until an ROI has been drawn on the live view, which
+keeps stray reflections outside the trap region from triggering captures.
+
 Classification uses the same 2-D Gaussian fitting as camera_gui:
 fitted σ is compared against a PSF σ reference to auto-classify each
 capture.  The user can override the auto-classification per capture.
@@ -34,6 +38,7 @@ import queue
 import math
 import threading
 import datetime
+import collections
 import numpy as np
 
 from PyQt5.QtWidgets import (
@@ -41,7 +46,7 @@ from PyQt5.QtWidgets import (
     QGridLayout, QGroupBox, QLabel, QLineEdit, QPushButton, QCheckBox,
     QComboBox, QSpinBox, QDoubleSpinBox, QFileDialog, QMessageBox,
     QSplitter, QSlider, QSizePolicy, QShortcut, QFrame, QListWidget,
-    QListWidgetItem, QProgressBar, QScrollArea, QAbstractItemView,
+    QListWidgetItem, QProgressBar, QScrollArea, QAbstractItemView, QTabWidget,
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QRect
 from PyQt5.QtGui import (
@@ -73,6 +78,17 @@ try:
     _HAS_PRESSURE = True
 except Exception:
     _HAS_PRESSURE = False
+
+# Laser power stabilization / particle drop (Red Pitaya via PyRPL) is optional
+# too: the tab degrades to a message if PyRPL or pyqtgraph are missing.
+try:
+    from camera.laser_stab import (
+        SharedLink, LaserStabPanel, HomodynePanel)
+    _HAS_LASER = True
+except Exception as _laser_exc:          # pragma: no cover
+    LaserStabPanel = None
+    _LASER_IMPORT_ERROR = str(_laser_exc)
+    _HAS_LASER = False
 
 _USER_CLASSES = ['single', 'cluster', 'uncertain', 'reject']
 
@@ -136,13 +152,25 @@ class PressureThread(QThread):
     Here the read happens in the background; the window keeps the most recent
     value and uses it when saving a capture, so a capture never blocks.
 
+    For responsive readings the thread holds the serial port **open** across
+    polls and issues the query directly: the driver's `read_pressure()` opens
+    and closes the port on every call, which costs far more than the query
+    itself and caps the usable rate at roughly 1 Hz.  With the port held open a
+    reading takes tens of milliseconds, so sub-second polling is practical —
+    fast enough to watch the gauge respond while adjusting a valve.  If the
+    port cannot be opened (no pyserial, port busy) it silently falls back to
+    the driver function, so behaviour is never worse than before.
+
     Polls every `interval` seconds while enabled; `trigger()` forces an
     immediate read (e.g. the "Read now" button) and `set_enabled(False)`
     pauses polling when auto-read is off.
     """
     reading = pyqtSignal(float, bool)   # (mbar, ok)
 
-    def __init__(self, read_fn, port: str, interval: float = 3.0):
+    # Agilent TwisTorr "read pressure" telegram (same bytes the driver sends).
+    _QUERY = bytes.fromhex('02 80 32 32 34 30 03 38 37')
+
+    def __init__(self, read_fn, port: str, interval: float = 0.5):
         super().__init__()
         self._read_fn  = read_fn
         self._port     = port
@@ -150,9 +178,16 @@ class PressureThread(QThread):
         self._enabled  = True
         self._stop     = False
         self._wake     = threading.Event()
+        self._ser      = None     # persistent serial handle, opened lazily
+        self._reopen   = False    # port changed → drop the handle
 
     def set_port(self, port: str) -> None:
-        self._port = port
+        self._port  = port
+        self._reopen = True
+        self._wake.set()
+
+    def set_interval(self, seconds: float) -> None:
+        self._interval = max(0.05, float(seconds))
         self._wake.set()
 
     def set_enabled(self, on: bool) -> None:
@@ -167,17 +202,185 @@ class PressureThread(QThread):
         self._stop = True
         self._wake.set()
 
+    # ── Serial handling ──────────────────────────────────────────────────────
+
+    def _close_port(self) -> None:
+        if self._ser is not None:
+            try:
+                self._ser.close()
+            except Exception:
+                pass
+            self._ser = None
+
+    def _read_fast(self) -> float:
+        """Query the gauge over the held-open port.  Raises on any failure."""
+        if self._ser is None:
+            import serial
+            self._ser = serial.Serial(self._port, 9600, timeout=0.5)
+        self._ser.reset_input_buffer()
+        self._ser.write(self._QUERY)
+        resp = self._ser.readline()
+        return float(resp[6:13].decode('UTF-8'))
+
+    def _read_once(self) -> float:
+        if self._reopen:
+            self._reopen = False
+            self._close_port()
+        try:
+            return self._read_fast()
+        except Exception:
+            # Drop the handle so the next poll reopens; fall back to the
+            # driver (which manages its own port) for this reading.
+            self._close_port()
+        try:
+            return self._read_fn(port=self._port)
+        except Exception:
+            return -1.0
+
     def run(self) -> None:
         while not self._stop:
             if self._enabled:
-                try:
-                    p = self._read_fn(port=self._port)
-                except Exception:
-                    p = -1.0
+                p  = self._read_once()
                 ok = (p is not None) and (p >= 0)
                 self.reading.emit(float(p) if ok else float('nan'), ok)
+            else:
+                self._close_port()
             self._wake.wait(self._interval)
             self._wake.clear()
+        self._close_port()
+
+
+# ── Large-format pressure display ─────────────────────────────────────────────
+
+class PressureDisplayWindow(QWidget):
+    """
+    Detachable, resizable pressure readout meant to be legible from across the
+    room while pumping / venting at the chamber rather than at the monitor.
+
+    The value's font is rescaled to the window on every resize, so making the
+    window bigger makes the digits bigger.  Below the value a trend line shows
+    the rate of change in decades per minute (the natural unit for a gauge
+    swinging over orders of magnitude) plus the age of the last reading — a
+    stale reading turns amber then red so a dead gauge is never mistaken for a
+    steady pressure.
+    """
+
+    closed = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent, Qt.Window)
+        self.setWindowTitle('Chamber Pressure')
+        self.resize(560, 300)
+        self.setStyleSheet('background: #0d0d0d;')
+
+        self._value_lbl = QLabel('—')
+        self._value_lbl.setAlignment(Qt.AlignCenter)
+        self._value_lbl.setStyleSheet('color: #00e5ff;')
+
+        self._trend_lbl = QLabel('')
+        self._trend_lbl.setAlignment(Qt.AlignCenter)
+        self._trend_lbl.setStyleSheet('color: #cccccc;')
+
+        self._age_lbl = QLabel('no reading yet')
+        self._age_lbl.setAlignment(Qt.AlignCenter)
+        self._age_lbl.setStyleSheet('color: #888888;')
+
+        self._on_top = QCheckBox('Always on top')
+        self._on_top.setStyleSheet('color: #aaa;')
+        self._on_top.toggled.connect(self._on_top_toggled)
+
+        vl = QVBoxLayout(self)
+        vl.setContentsMargins(12, 8, 12, 8)
+        vl.addStretch()
+        vl.addWidget(self._value_lbl)
+        vl.addWidget(self._trend_lbl)
+        vl.addWidget(self._age_lbl)
+        vl.addStretch()
+        vl.addWidget(self._on_top, 0, Qt.AlignRight)
+
+        self._last_t: float | None = None
+        self._rescale()
+
+        # Ages the reading even when the gauge stops replying.
+        self._tick = QTimer(self)
+        self._tick.setInterval(250)
+        self._tick.timeout.connect(self._update_age)
+        self._tick.start()
+
+    def _on_top_toggled(self, on: bool) -> None:
+        self.setWindowFlag(Qt.WindowStaysOnTopHint, on)
+        self.show()          # re-applying flags hides the window
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._rescale()
+
+    def _rescale(self) -> None:
+        h = max(self.height(), 120)
+        big = QFont('Arial', 10, QFont.Bold)
+        big.setPixelSize(max(24, int(h * 0.34)))
+        self._value_lbl.setFont(big)
+        mid = QFont('Arial')
+        mid.setPixelSize(max(11, int(h * 0.09)))
+        self._trend_lbl.setFont(mid)
+        small = QFont('Arial')
+        small.setPixelSize(max(10, int(h * 0.06)))
+        self._age_lbl.setFont(small)
+
+    def set_reading(self, value: float, ok: bool, history: list) -> None:
+        """
+        Show a new reading.  `history` is [(t, mbar)] oldest-first, used for the
+        trend; only the last few seconds of it matter.
+        """
+        if ok:
+            self._value_lbl.setText(f'{value:.2e} mbar')
+            self._value_lbl.setStyleSheet('color: #00e5ff;')
+            self._last_t = time.time()
+        else:
+            self._value_lbl.setText('gauge error')
+            self._value_lbl.setStyleSheet('color: #ff5555;')
+        self._trend_lbl.setText(self._trend_text(history))
+        self._update_age()
+
+    def set_idle(self, message: str) -> None:
+        """Show a non-reading state (auto-read off, no gauge, …)."""
+        self._value_lbl.setText('—')
+        self._value_lbl.setStyleSheet('color: #666666;')
+        self._trend_lbl.setText(message)
+        self._age_lbl.setText('')
+        self._last_t = None
+
+    @staticmethod
+    def _trend_text(history: list) -> str:
+        """Rate of change over the last ≤10 s, in decades per minute."""
+        now    = time.time()
+        recent = [(t, v) for t, v in history
+                  if now - t <= 10.0 and v is not None and v > 0]
+        if len(recent) < 3:
+            return ''
+        span = recent[-1][0] - recent[0][0]
+        if span < 1.0:
+            return ''
+        decades = math.log10(recent[-1][1] / recent[0][1])
+        rate    = decades / span * 60.0
+        if abs(rate) < 0.02:
+            return '→  steady'
+        arrow = '↓ pumping down' if rate < 0 else '↑ rising'
+        return f'{arrow}   {abs(rate):.2f} decades/min'
+
+    def _update_age(self) -> None:
+        if self._last_t is None:
+            return
+        age = time.time() - self._last_t
+        self._age_lbl.setText(f'updated {age:.1f} s ago')
+        color = ('#888888' if age < 3 else
+                 '#ffaa00' if age < 10 else '#ff5555')
+        self._age_lbl.setStyleSheet(f'color: {color};')
+
+    def closeEvent(self, event) -> None:
+        self._tick.stop()
+        self.closed.emit()
+        super().closeEvent(event)
 
 
 # ── Trap tracker ──────────────────────────────────────────────────────────────
@@ -554,7 +757,8 @@ class TrapMonitorWindow(QMainWindow):
         self._background:  np.ndarray | None = None
         self._last_blobs:  list  = []
         self._last_cls:    str   = 'none'
-        self._rotation_k:  int   = 0
+        # Default view is 90° CW — matches how the camera sits on the trap.
+        self._rotation_k:  int   = 3
         self._fps:         float = 0.0
         self._fps_counter: int   = 0
         self._fps_t0:      float = time.time()
@@ -591,6 +795,15 @@ class TrapMonitorWindow(QMainWindow):
         # ever blocking the GUI thread (see PressureThread).
         self._pressure_thread: PressureThread | None = None
         self._last_pressure:    float | None = None
+        # Recent (t, mbar) readings — feeds the trend on the expanded panel.
+        self._pressure_history: collections.deque = collections.deque(maxlen=400)
+        self._pressure_window: PressureDisplayWindow | None = None
+
+        # Laser stabilization tab + particle drops recorded per loading
+        self._laser_panel = None
+        self._homodyne_panel = None
+        self._rp_link = None
+        self._drops_this_loading: list = []
 
         self._display_timer = QTimer(self)
         self._display_timer.timeout.connect(self._poll_frame)
@@ -606,7 +819,8 @@ class TrapMonitorWindow(QMainWindow):
         if self._use_mock or not _HAS_PRESSURE:
             return
         self._pressure_thread = PressureThread(
-            _hw_read_pressure, self._pressure_port_edit.text().strip())
+            _hw_read_pressure, self._pressure_port_edit.text().strip(),
+            interval=self._pressure_interval_spin.value())
         self._pressure_thread.set_enabled(self._pressure_auto.isChecked())
         self._pressure_thread.reading.connect(self._on_pressure_reading)
         self._pressure_thread.start()
@@ -614,6 +828,20 @@ class TrapMonitorWindow(QMainWindow):
     # ── UI construction ───────────────────────────────────────────────────────
 
     def _build_ui(self) -> None:
+        # Laser tab is created first so the Trap Detection group can wire its
+        # Drop button to it.
+        if _HAS_LASER:
+            # One PyRPL connection to the Red Pitaya, shared by both lock tabs
+            # (a second PyRPL client to the same board would break the first).
+            self._rp_link = SharedLink(use_mock=self._use_mock)
+            # embed_drop=False: the drop controls live under the camera view
+            # on this tab, where the operator decides whether to drop.
+            self._laser_panel = LaserStabPanel(self._rp_link, embed_drop=False)
+            self._laser_panel.message.connect(self._status_label_set)
+            self._laser_panel.dropped.connect(self._on_particle_dropped)
+            self._homodyne_panel = HomodynePanel(self._rp_link)
+            self._homodyne_panel.message.connect(self._status_label_set)
+
         splitter = QSplitter(Qt.Horizontal)
 
         # Left: camera + settings (scrollable — many groups stacked)
@@ -646,6 +874,8 @@ class TrapMonitorWindow(QMainWindow):
         cv.addWidget(self._live)
         cv.addWidget(self._build_contrast_bar())
         cv.addWidget(self._build_trap_status_bar())
+        if self._laser_panel is not None:
+            cv.addWidget(self._laser_panel.drop_group)
 
         # Right: captures
         right = QWidget()
@@ -658,9 +888,24 @@ class TrapMonitorWindow(QMainWindow):
         splitter.addWidget(right)
         splitter.setStretchFactor(1, 1)
 
+        # Tabs: the monitor page and the laser-stabilization page share the
+        # status bar below.
+        self._tabs = QTabWidget()
+        self._tabs.addTab(splitter, 'Trap monitor')
+        if self._laser_panel is not None:
+            self._tabs.addTab(self._laser_panel, 'Laser stabilization')
+            self._tabs.addTab(self._homodyne_panel, 'Homodyne phase lock')
+        else:
+            missing = QLabel(
+                'Laser stabilization unavailable:\n'
+                f'{globals().get("_LASER_IMPORT_ERROR", "import failed")}\n\n'
+                'Install pyrpl and pyqtgraph to enable this tab.')
+            missing.setAlignment(Qt.AlignCenter)
+            self._tabs.addTab(missing, 'Laser stabilization')
+
         container = QWidget()
         vl = QVBoxLayout(container)
-        vl.addWidget(splitter)
+        vl.addWidget(self._tabs)
         vl.addWidget(self._build_status_bar())
         self.setCentralWidget(container)
 
@@ -712,10 +957,25 @@ class TrapMonitorWindow(QMainWindow):
 
         self._rotation_combo = QComboBox()
         self._rotation_combo.addItems(['0°', '90° CW', '180°', '90° CCW'])
+        # 90° CW is the default orientation; set before connecting so the
+        # handler (which invalidates the background) does not fire at startup.
+        self._rotation_combo.setCurrentIndex(1)
         self._rotation_combo.currentIndexChanged.connect(self._on_rotation_changed)
 
         self._bg_check = QCheckBox('Subtract background')
         self._bg_check.setEnabled(False)
+        self._bg_check.toggled.connect(self._on_bg_check_toggled)
+
+        # Background subtraction is a *detection* aid: it kills the static
+        # speckle so blobs stand out.  The subtracted image is often hard to
+        # look at, so this lets the live view keep showing the raw frame while
+        # analysis still runs on the subtracted one.
+        self._bg_show_raw = QCheckBox('… but display unsubtracted image')
+        self._bg_show_raw.setEnabled(False)
+        self._bg_show_raw.setToolTip(
+            'Keep the live view on the raw frame while trap detection still '
+            'runs on the background-subtracted image.')
+
         self._capture_bg_btn = QPushButton('Capture background (B)')
         self._capture_bg_btn.setEnabled(False)
         self._capture_bg_btn.clicked.connect(self._on_capture_background)
@@ -727,7 +987,8 @@ class TrapMonitorWindow(QMainWindow):
         layout.addWidget(QLabel('Rotation:'), 2, 0)
         layout.addWidget(self._rotation_combo, 2, 1)
         layout.addWidget(self._bg_check,      3, 0, 1, 2)
-        layout.addWidget(self._capture_bg_btn, 4, 0, 1, 2)
+        layout.addWidget(self._bg_show_raw,   4, 0, 1, 2)
+        layout.addWidget(self._capture_bg_btn, 5, 0, 1, 2)
         return g
 
     def _build_analysis_group(self) -> QGroupBox:
@@ -789,7 +1050,7 @@ class TrapMonitorWindow(QMainWindow):
             self._pressure_auto.setToolTip(
                 'Gauge driver unavailable — manual entry only.')
 
-        self._pressure_port_edit = QLineEdit('COM6')
+        self._pressure_port_edit = QLineEdit('COM7')
         self._pressure_port_edit.setMaximumWidth(70)
         self._pressure_port_edit.editingFinished.connect(
             self._on_pressure_port_changed)
@@ -800,6 +1061,27 @@ class TrapMonitorWindow(QMainWindow):
 
         self._pressure_src_lbl = QLabel('source: manual')
         self._pressure_src_lbl.setStyleSheet('color: #888; font-size: 8pt;')
+
+        # Poll rate.  The gauge port is held open by PressureThread, so a
+        # reading costs tens of ms and sub-second polling is realistic — needed
+        # when watching the gauge respond to a valve in real time.
+        self._pressure_interval_spin = QDoubleSpinBox()
+        self._pressure_interval_spin.setRange(0.1, 30.0)
+        self._pressure_interval_spin.setValue(0.5)
+        self._pressure_interval_spin.setSuffix(' s')
+        self._pressure_interval_spin.setSingleStep(0.1)
+        self._pressure_interval_spin.setDecimals(1)
+        self._pressure_interval_spin.setToolTip(
+            'How often the gauge is polled while auto-read is on.')
+        self._pressure_interval_spin.valueChanged.connect(
+            self._on_pressure_interval_changed)
+
+        # Large detached readout for watching the gauge from across the room.
+        self._pressure_expand_btn = QPushButton('Expand readout (P)')
+        self._pressure_expand_btn.setToolTip(
+            'Open a large, resizable pressure display in its own window '
+            '(can be kept always-on-top and dragged to another screen).')
+        self._pressure_expand_btn.clicked.connect(self._on_toggle_pressure_window)
 
         # Manually-entered solution concentration / dilution.  Stored on each
         # loading session and capture so the library is groupable by it.
@@ -817,9 +1099,12 @@ class TrapMonitorWindow(QMainWindow):
         layout.addWidget(QLabel('Gauge port:'),      2, 0)
         layout.addWidget(self._pressure_port_edit,   2, 1)
         layout.addWidget(self._pressure_read_btn,    2, 2)
-        layout.addWidget(self._pressure_src_lbl,     3, 0, 1, 3)
-        layout.addWidget(QLabel('Solution conc.:'),  4, 0)
-        layout.addWidget(self._concentration_edit,   4, 1, 1, 2)
+        layout.addWidget(QLabel('Poll every:'),      3, 0)
+        layout.addWidget(self._pressure_interval_spin, 3, 1, 1, 2)
+        layout.addWidget(self._pressure_src_lbl,     4, 0, 1, 3)
+        layout.addWidget(self._pressure_expand_btn,  5, 0, 1, 3)
+        layout.addWidget(QLabel('Solution conc.:'),  6, 0)
+        layout.addWidget(self._concentration_edit,   6, 1, 1, 2)
         return g
 
     def _build_backscatter_group(self) -> QGroupBox:
@@ -906,7 +1191,7 @@ class TrapMonitorWindow(QMainWindow):
         self._roi_clear_btn.setEnabled(False)
         self._roi_clear_btn.clicked.connect(self._on_roi_clear)
 
-        self._roi_label = QLabel('Full frame')
+        self._roi_label = QLabel('No ROI — detection off')
         self._roi_label.setAlignment(Qt.AlignCenter)
         self._roi_label.setStyleSheet('color: #00e5ff; font-size: 9pt;')
 
@@ -1176,6 +1461,35 @@ class TrapMonitorWindow(QMainWindow):
             lambda: self._live.zoom_by(1 / 1.25))
         QShortcut(QKeySequence('0'), self).activated.connect(
             self._live.reset_zoom)
+        QShortcut(QKeySequence('P'), self).activated.connect(
+            self._on_toggle_pressure_window)
+
+    # ── Laser stabilization / particle drop ──────────────────────────────────
+
+    def _status_label_set(self, text: str) -> None:
+        self._status_label.setText(text)
+
+    def _on_particle_dropped(self, info: dict) -> None:
+        """Record the drop on the current loading session (if any)."""
+        rec = {
+            'timestamp': info.get('timestamp', ''),
+            'hold_v':    float(info.get('hold_v', float('nan'))),
+            'dwell_ms':  int(info.get('dwell_ms', 0)),
+            'restored_ival': float(info.get('saved_ival', float('nan'))),
+            'trap_duration_s': self._trap_tracker.duration,
+            'auto_classification': self._last_cls,
+        }
+        self._drops_this_loading.append(rec)
+        self._trap_label.setText('Particle dropped')
+        lid = self._current_loading_id
+        if lid and self._capture_store is not None:
+            try:
+                self._capture_store.set_loading_attr(
+                    lid, 'n_drops', len(self._drops_this_loading))
+                self._capture_store.set_loading_attr(
+                    lid, 'drops', json.dumps(self._drops_this_loading))
+            except Exception as exc:
+                self._status_label.setText(f'Drop record failed: {exc}')
 
     # ── Camera actions ────────────────────────────────────────────────────────
 
@@ -1229,8 +1543,9 @@ class TrapMonitorWindow(QMainWindow):
 
         for w in [self._exposure_spin, self._gain_spin,
                   self._capture_bg_btn, self._capture_now_btn,
-                  self._monitor_btn, self._roi_btn]:
+                  self._roi_btn]:
             w.setEnabled(True)
+        self._update_monitor_enabled()
         self._disconnect_btn.setEnabled(True)
         self._connect_btn.setEnabled(False)
 
@@ -1265,7 +1580,7 @@ class TrapMonitorWindow(QMainWindow):
         self._monitor_btn.setChecked(False)
         self._monitor_btn.setText('Start Monitoring')
         self._live.clear_roi()
-        self._roi_label.setText('Full frame')
+        self._roi_label.setText('No ROI — detection off')
         self._disconnect_btn.setEnabled(False)
         self._connect_btn.setEnabled(True)
         self._live.setText('No camera connected')
@@ -1294,6 +1609,8 @@ class TrapMonitorWindow(QMainWindow):
             self._bg_check.setChecked(False)
             self._bg_check.setEnabled(False)
             self._status_label.setText('Rotation changed — recapture background')
+        # The ROI is in image coordinates, which rotation invalidates.
+        self._live.clear_roi()
         self._disp_buf = self._false_color_buf = None
         self._live.reset_zoom()
 
@@ -1304,6 +1621,10 @@ class TrapMonitorWindow(QMainWindow):
         self._bg_check.setEnabled(True)
         self._bg_check.setChecked(True)
         self._status_label.setText('Background captured')
+
+    def _on_bg_check_toggled(self, on: bool) -> None:
+        """The display-raw option only means anything while subtracting."""
+        self._bg_show_raw.setEnabled(on)
 
     def _on_contrast_mode_changed(self) -> None:
         manual = not self._contrast_auto.isChecked()
@@ -1317,6 +1638,11 @@ class TrapMonitorWindow(QMainWindow):
     def _on_pressure_reading(self, value: float, ok: bool) -> None:
         """Receive a background gauge reading and cache / display it."""
         self._last_pressure = value if ok else None
+        if ok:
+            self._pressure_history.append((time.time(), value))
+        if self._pressure_window is not None:
+            self._pressure_window.set_reading(
+                value, ok, list(self._pressure_history))
         if not self._pressure_auto.isChecked():
             return
         if ok:
@@ -1330,6 +1656,45 @@ class TrapMonitorWindow(QMainWindow):
             self._pressure_thread.set_enabled(on)
         self._pressure_src_lbl.setText(
             'source: gauge' if on else 'source: manual')
+        if self._pressure_window is not None and not on:
+            self._pressure_window.set_idle('auto-read is off')
+
+    def _on_pressure_interval_changed(self, seconds: float) -> None:
+        if self._pressure_thread is not None:
+            self._pressure_thread.set_interval(seconds)
+
+    # ── Expanded pressure readout ────────────────────────────────────────────
+
+    def _on_toggle_pressure_window(self) -> None:
+        """Open (or close) the large detached pressure display."""
+        if self._pressure_window is not None:
+            self._pressure_window.close()
+            return
+
+        win = PressureDisplayWindow(self)
+        win.closed.connect(self._on_pressure_window_closed)
+        self._pressure_window = win
+
+        if self._pressure_thread is None:
+            win.set_idle('gauge unavailable — manual entry only'
+                         if not _HAS_PRESSURE else 'gauge not polling')
+        elif not self._pressure_auto.isChecked():
+            # A big readout is useless without polling — turn it back on.
+            self._pressure_auto.setChecked(True)
+        elif self._last_pressure is not None:
+            win.set_reading(self._last_pressure, True,
+                            list(self._pressure_history))
+        else:
+            win.set_idle('waiting for first reading…')
+
+        if self._pressure_thread is not None:
+            self._pressure_thread.trigger()
+        win.show()
+        self._pressure_expand_btn.setText('Close readout (P)')
+
+    def _on_pressure_window_closed(self) -> None:
+        self._pressure_window = None
+        self._pressure_expand_btn.setText('Expand readout (P)')
 
     def _on_pressure_port_changed(self) -> None:
         if self._pressure_thread is not None:
@@ -1414,6 +1779,28 @@ class TrapMonitorWindow(QMainWindow):
 
     # ── Frame loop ────────────────────────────────────────────────────────────
 
+    def _roi_box(self, shape: tuple) -> tuple | None:
+        """
+        The current ROI clamped to the frame, or None if no usable ROI is set.
+
+        Detection is gated on this: with no ROI there is nothing to analyse.
+        """
+        roi = self._live.roi
+        if roi is None:
+            return None
+        h, w = shape[0], shape[1]
+        x0, y0, x1, y1 = roi
+        x0 = max(0, int(x0));  y0 = max(0, int(y0))
+        x1 = min(w, int(x1));  y1 = min(h, int(y1))
+        if x1 <= x0 or y1 <= y0:
+            return None
+        return x0, y0, x1, y1
+
+    def _has_roi(self) -> bool:
+        if self._last_frame is not None:
+            return self._roi_box(self._last_frame.shape) is not None
+        return self._live.roi is not None
+
     def _poll_frame(self) -> None:
         try:
             frame = self._frame_queue.get_nowait()
@@ -1434,32 +1821,42 @@ class TrapMonitorWindow(QMainWindow):
             self._fps_label.setText(f'FPS: {self._fps:.1f}')
         self._frame_label.setText(f'Frame: {self._frame_count}')
 
-        display_image = frame
+        # Background subtraction feeds detection; the live view optionally
+        # keeps showing the raw frame so the operator sees the real image.
+        subtracted = None
         if self._bg_check.isChecked() and self._background is not None:
-            display_image = np.clip(
+            subtracted = np.clip(
                 frame.astype(np.int32) - self._background.astype(np.int32),
                 0, None).astype(np.uint16)
 
-        if self._analysis_thread is not None:
-            analysis_image = display_image
-            roi_offset     = (0, 0)
-            roi = self._live.roi
-            if roi is not None:
-                rx0, ry0, rx1, ry1 = roi
-                rx0 = max(0, rx0);  ry0 = max(0, ry0)
-                rx1 = min(frame.shape[1], rx1)
-                ry1 = min(frame.shape[0], ry1)
-                if rx1 > rx0 and ry1 > ry0:
-                    analysis_image = display_image[ry0:ry1, rx0:rx1]
-                    roi_offset     = (rx0, ry0)
+        analysis_source = subtracted if subtracted is not None else frame
+        if subtracted is not None and not self._bg_show_raw.isChecked():
+            display_image = subtracted
+        else:
+            display_image = frame
+
+        # Sphere finding only runs inside a user-defined ROI: outside a chosen
+        # region the frame is full of stray reflections that trigger spurious
+        # detections, so an undefined ROI means no detection at all.
+        roi_box = self._roi_box(frame.shape)
+        if self._analysis_thread is not None and roi_box is not None:
+            rx0, ry0, rx1, ry1 = roi_box
             self._analysis_thread.submit(
-                analysis_image,
+                analysis_source[ry0:ry1, rx0:rx1],
                 self._thresh_spin.value(),
                 self._minarea_spin.value(),
                 self._psf_sigma_spin.value(),
                 self._sigma_tol_spin.value(),
-                roi_offset,
+                (rx0, ry0),
             )
+        elif roi_box is None:
+            # No ROI: drop any stale blobs and let the trap clock decay, so a
+            # cleared ROI cannot leave a capture pending.
+            self._last_blobs = []
+            self._last_cls   = 'none'
+            self._trap_tracker.update(False, now)
+            self._trap_progress.setValue(0)
+            self._trap_label.setText('Draw an ROI to enable detection')
 
         qimg = self._frame_to_qimage(display_image)
         self._live.update_frame(
@@ -1503,6 +1900,13 @@ class TrapMonitorWindow(QMainWindow):
 
     def _on_toggle_monitoring(self, checked: bool) -> None:
         if checked:
+            if not self._has_roi():
+                self._monitor_btn.setChecked(False)
+                QMessageBox.information(
+                    self, 'No ROI',
+                    'Draw a region of interest on the live view before '
+                    'monitoring — sphere finding only runs inside an ROI.')
+                return
             self._start_countdown()
         else:
             self._stop_monitoring()
@@ -1568,6 +1972,7 @@ class TrapMonitorWindow(QMainWindow):
     def _start_loading_session(self) -> None:
         """Record a new loading session keyed by the moment monitoring began."""
         self._current_loading_id = None
+        self._drops_this_loading = []
         if self._capture_store is None:
             return
         pressure, p_source = self._current_pressure()
@@ -1596,12 +2001,28 @@ class TrapMonitorWindow(QMainWindow):
         self._roi_btn.setChecked(False)
         self._roi_btn.setText('Draw ROI')
         if roi is None:
-            self._roi_label.setText('Full frame')
+            self._roi_label.setText('No ROI — detection off')
             self._roi_clear_btn.setEnabled(False)
+            # Detection cannot continue without a region; stop cleanly rather
+            # than leaving monitoring armed but blind.
+            if self._monitoring or self._starting:
+                self._stop_monitoring()
+                self._status_label.setText('ROI cleared — monitoring stopped')
         else:
             x0, y0, x1, y1 = roi
             self._roi_label.setText(f'ROI: {x1-x0}×{y1-y0} px  ({x0},{y0})')
             self._roi_clear_btn.setEnabled(True)
+        self._last_blobs = []
+        self._update_monitor_enabled()
+
+    def _update_monitor_enabled(self) -> None:
+        """Monitoring requires a camera *and* an ROI to look in."""
+        ready = self._camera is not None and self._has_roi()
+        self._monitor_btn.setEnabled(ready)
+        self._monitor_btn.setToolTip(
+            '' if ready else
+            'Draw an ROI on the live view first — sphere finding only runs '
+            'inside a defined region.')
 
     def _do_capture(self) -> None:
         """Save the current frame as a trap capture."""
@@ -2305,10 +2726,24 @@ class TrapMonitorWindow(QMainWindow):
             return QImage(self._disp_buf.data, w, h, w, QImage.Format_Grayscale8)
 
     def closeEvent(self, event) -> None:
+        if self._pressure_window is not None:
+            win, self._pressure_window = self._pressure_window, None
+            win.close()
         if self._pressure_thread is not None:
             self._pressure_thread.request_stop()
             self._pressure_thread.wait(2000)
             self._pressure_thread = None
+        for panel in (self._laser_panel, self._homodyne_panel):
+            if panel is not None:
+                try:
+                    panel.shutdown()
+                except Exception:
+                    pass
+        if self._rp_link is not None:
+            try:
+                self._rp_link.disconnect_board()
+            except Exception:
+                pass
         self._on_bs_disconnect()
         self._on_disconnect()
         super().closeEvent(event)
