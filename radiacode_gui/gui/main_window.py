@@ -260,11 +260,17 @@ class MainWindow(QMainWindow):
         self._status.showMessage(f'Device disconnected: {address}')
 
     def _on_connect_failed(self, address: str, error: str):
-        QMessageBox.warning(
-            self, 'Connection Failed',
-            f'Could not connect to {address}:\n\n{error}'
-        )
-        self._status.showMessage(f'Connect failed: {address}')
+        log.error('connect failed %s: %s', address, error)
+        self._status.showMessage(f'Connect failed: {address} — {error}')
+        # The scan dialog (if open) shows the error inline; only pop a box
+        # when the failure came from a Reconnect button on a panel.
+        if self.findChild(ScanDialog) is None:
+            QMessageBox.warning(
+                self, 'Connection Failed',
+                f'Could not connect to {address}:\n\n{error}\n\n'
+                'Checklist: device switched on, phone app closed, '
+                'device NOT paired in Windows Bluetooth settings.'
+            )
 
     def _on_realtime(self, address: str, item: RealTimeData):
         panel = self._panels.get(address)

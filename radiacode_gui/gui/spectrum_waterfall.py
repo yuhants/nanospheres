@@ -166,7 +166,9 @@ class SpectrumWaterfall(QWidget):
             self._cbar = None
 
         if self._log:
-            vmax = max(1.0, data.max())
+            # vmax must be strictly > vmin or LogNorm/colorbar raise ValueError
+            # (an all-zero interval right after a spectrum reset).
+            vmax = max(2.0, float(data.max()))
             norm = LogNorm(vmin=1.0, vmax=vmax)
             plot_data = np.clip(data, 1.0, None)
         else:

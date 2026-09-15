@@ -109,6 +109,24 @@ class ScanDialog(QDialog):
         self._mgr.scan_finished.connect(self._on_scan_finished)
         self._mgr.scan_error.connect(self._on_scan_error)
         self._mgr.device_connected.connect(self._on_device_connected)
+        self._mgr.device_connect_failed.connect(self._on_connect_failed)
+
+    def done(self, result: int):
+        # The dialog is parented to the main window, so its C++ object outlives
+        # exec_(). Without this, every dialog ever opened would keep receiving
+        # (and acting on) scan/connect signals forever.
+        for sig, slot in (
+            (self._mgr.scan_finished,         self._on_scan_finished),
+            (self._mgr.scan_error,            self._on_scan_error),
+            (self._mgr.device_connected,      self._on_device_connected),
+            (self._mgr.device_connect_failed, self._on_connect_failed),
+        ):
+            try:
+                sig.disconnect(slot)
+            except TypeError:
+                pass
+        super().done(result)
+        self.deleteLater()
 
     def _start_scan(self):
         if self._scanning:
@@ -183,7 +201,7 @@ class ScanDialog(QDialog):
             self._emit_connect_item(item)
 
     def _on_connect(self):
-        mac_text = self._mac_edit.text().strip()
+        mac_text = self._mac_edit.text().strip().upper()
         if mac_text and len(mac_text) == 17:
             self._emit_connect_address(mac_text, f'RC [{mac_text[-8:]}]')
             return
@@ -205,10 +223,32 @@ class ScanDialog(QDialog):
         self._connect_btn.setEnabled(False)
         self.connect_requested.emit(address, name)
 
-    def _on_device_connected(self, address: str, *_):
-        self._already_connected.add(address)
+    def _find_item(self, address: str):
+        address = address.upper()
         for i in range(self._list.count()):
             item = self._list.item(i)
             data = item.data(Qt.UserRole)
-            if data and data[0] == address and '[connecting…]' in item.text():
-                item.setText(item.text().replace('[connecting…]', '[connected]'))
+            if data and data[0].upper() == address:
+                return item
+        return None
+
+    def _on_device_connected(self, address: str, *_):
+        self._already_connected.add(address)
+        item = self._find_item(address)
+        if item is not None and '[connecting…]' in item.text():
+            item.setText(item.text().replace('[connecting…]', '[connected]'))
+        self._status_label.setText(f'Connected to {address}')
+        self._status_label.setStyleSheet('color: #2e7d32;')
+
+    def _on_connect_failed(self, address: str, error: str):
+        # Let the user retry from this dialog instead of leaving the entry
+        # greyed out as "[connecting…]" forever.
+        self._already_connected.discard(address)
+        item = self._find_item(address)
+        if item is not None:
+            item.setText(item.text().replace('  [connecting…]', ''))
+            item.setFlags(item.flags() | Qt.ItemIsEnabled)
+        self._mac_edit.setEnabled(True)
+        self._status_label.setText(f'Connect failed: {error}')
+        self._status_label.setStyleSheet('color: #c62828;')
+        self._update_connect_btn()

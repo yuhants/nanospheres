@@ -200,11 +200,13 @@ class DevicePanel(QWidget):
 
     def on_rare(self, item: RareData):
         self._last_rare = item
-        if hasattr(item, 'temperature') and item.temperature is not None:
-            self._temp_val.set_value(f'{item.temperature:.1f}')
-        if hasattr(item, 'charge_level') and item.charge_level is not None:
+        temp = getattr(item, 'temperature', None)
+        if temp is not None and temp == temp:          # not NaN
+            self._temp_val.set_value(f'{temp:.1f}')
+        bat = getattr(item, 'charge_level', None)
+        if bat is not None and bat == bat:             # NaN until first RareData
             # charge_level is already a percentage (decoder divides raw by 100)
-            pct = max(0.0, min(100.0, item.charge_level))
+            pct = max(0.0, min(100.0, bat))
             self._bat_val.set_value(f'{pct:.0f}%')
         self._time_series.add_rare(item)
 

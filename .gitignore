@@ -8,3 +8,13 @@ __pycache__/
 
 # Vendor SDKs
 scientific_camera_interfaces_windows-2.1/
+
+# RadiaCode GUI runtime log
+radiacode_gui.log*
+
+# Laser-stabilization tab settings (per machine)
+camera/laser_stab_settings.json
+
+# Editor backup files
+*~
+*.un~

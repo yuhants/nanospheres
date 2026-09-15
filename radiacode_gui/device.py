@@ -18,6 +18,9 @@ from .ble_transport import BleakTransport
 
 log = logging.getLogger(__name__)
 
+# Spectrum layout used by firmware 4.x when CONFIGURATION cannot be read.
+_DEFAULT_SPECTRUM_FORMAT = 1
+
 DataBufItem = Union[RealTimeData, DoseRateDB, RareData, RawData, Event]
 
 
@@ -70,16 +73,33 @@ class RadiaCodeBLE:
         r = await self._read_vs(VS.SERIAL_NUMBER)
         self.serial = r.data().decode('ascii').strip()
 
-        # Spectrum format version (needed for decoding)
-        r = await self._read_vs(VS.CONFIGURATION)
-        config = r.data().decode('cp1251')
-        for line in config.split('\n'):
-            if line.startswith('SpecFormatVersion'):
-                try:
-                    self._spectrum_format_version = int(line.split('=')[1].strip())
-                except ValueError:
-                    pass
-                break
+        # Spectrum format version (needed for decoding). CONFIGURATION is the
+        # first *large* read of the session — several kilobytes arriving as a
+        # long burst of BLE notifications — and it is exactly the kind of
+        # transfer a flaky adapter loses packets in. Don't let it abort an
+        # otherwise working session: every other command is small, and the only
+        # thing at stake is decoding the spectrum, where the firmware-4.x
+        # default is right for these units.
+        self._spectrum_format_version = _DEFAULT_SPECTRUM_FORMAT
+        for attempt in (1, 2):
+            try:
+                r = await self._read_vs(VS.CONFIGURATION)
+            except Exception as e:
+                log.warning('[%s] configuration read failed (attempt %d/2): %s',
+                            self.address, attempt, e)
+                continue
+            config = r.data().decode('cp1251')
+            for line in config.split('\n'):
+                if line.startswith('SpecFormatVersion'):
+                    try:
+                        self._spectrum_format_version = int(line.split('=')[1].strip())
+                    except ValueError:
+                        pass
+                    break
+            break
+        else:
+            log.warning('[%s] using default spectrum format version %d',
+                        self.address, self._spectrum_format_version)
 
         log.info('[%s] initialized — serial=%s fw=%s fmt=%d',
                  self.address, self.serial, self.firmware,
@@ -171,6 +191,12 @@ class RadiaCodeBLE:
 
     async def read_temperature(self) -> float:
         """Read the live device temperature (°C) directly from a register.
+
+        DANGER: RC-102 firmware 4.14 does not answer this over BLE. The device
+        stops responding to every subsequent request, drops the link ~9 s later
+        and powers itself off. Left here for firmware that may support it, but
+        the GUI keeps it disabled (DeviceManager.poll_temperature) and takes
+        temperature from the RareData packet instead.
 
         Unlike temperature carried in the periodic RareData buffer packet
         (which the device emits only every tens of seconds), the ``TEMP_degC``
