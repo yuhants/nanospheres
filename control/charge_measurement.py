@@ -42,7 +42,7 @@ AMPLIFIED = True
 OFFSET1 = 0
 OFFSET2 = 0
 
-AMP = 5
+AMP = 50
 FREQ = 87000
 
 # AMP = 0.25

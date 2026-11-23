@@ -18,6 +18,7 @@ utils/                # Shared analysis utilities imported by notebooks
 analysis_notebooks/   # Jupyter notebooks for offline data analysis (date-named)
 calculation/          # Theory/modelling notebooks
 lab_gui/              # Single-page PyQt5 GUI for routine tasks (E field, HV, pulses)
+daq/                  # Picoscope DAQ GUI: monitor/record fast data + derived slow data
 archived/             # Deprecated code
 ```
 
@@ -41,6 +42,34 @@ routine task, replacing the edit-the-top-and-run scripts
 The window owns the shared log, the "All outputs OFF" button (also Escape), the
 "●" active marker on each section heading, and presets covering every section in
 one JSON.
+
+## Picoscope DAQ GUI (`daq/`)
+
+`python daq/daq_gui.py` — monitor / record with one scope session
+(`picoscope_daq.py`: `PicoscopeDAQ.monitor_stream()`, `acquire_one()` +
+`write_hdf5()` per file).
+
+- **Monitor stream** (Live view group): `Roll` is one endless stream;
+  `Sweeps` (`monitor_stream(burst=True)`, as a bench scope does) takes a bounded full-rate window per
+  refresh, buffered in the scope. Channels x rate x 2 B above the link's
+  sustained throughput (~20 MB/s on a USB 2.0 port) corrupts a continuous
+  monitor after tens of seconds (thick traces, PSD comb at fs/512); `Auto`
+  switches to sweeps above `USB2_STREAM_LIMIT` / `USB3_STREAM_LIMIT`.
+- **Slow inputs** (lock-in amplifier output, temperature...) share the scope
+  with fast ones — the scope has one sample rate, so they are sampled fast and
+  averaged in software. Channel table Save = `Slow` (`ChannelConfig.slow`)
+  keeps a channel as a slow series instead of a waveform.
+  - `slow_data.py` (no Qt) — `SlowReducer`: one row per 1/rate s with
+    `mean_<ch>`, `rms_<ch>` (plus an optional software lock-in,
+    `<name>_x/_y/_r/_phase/_ref/_freq`). `SlowPipeline` runs it on its own
+    thread, fed by the `on_samples` tap of both streaming callbacks — the driver
+    callback must only enqueue. In burst monitoring each burst gives one row.
+    `read_slow(path)` reads the result back.
+  - `slow_panel.py` — "Slow data" tab and the strip chart under the fast plots.
+  - On disk: group `/slow` (`time` in unix s + one dataset per column) inside
+    each recorded file, and optionally a continuous
+    `<prefix>slow_<date>_<time>.hdf5` log that also runs while monitoring.
+  - Sources that are not scope channels (serial/USB sensors) are not handled.
 
 ## Trap monitor GUI (`camera/`)
 

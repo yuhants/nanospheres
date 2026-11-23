@@ -1,0 +1,73 @@
+PART VOLUMES (cm^3 of plastic)
+  bottom_tub                 84.3   solids: 1
+  top_tub                   101.8   solids: 1
+  bottom_lid                 33.8   solids: 1
+  top_lid                    24.1   solids: 1
+  collar_quarter_0            7.2   solids: 1
+  collar_cap_0                0.9   solids: 1
+  collar_quarter_1            7.2   solids: 1
+  collar_cap_1                0.9   solids: 1
+  collar_quarter_2            7.2   solids: 1
+  collar_cap_2                0.9   solids: 1
+  collar_quarter_3            7.2   solids: 1
+  collar_cap_3                0.9   solids: 1
+POWDER VOLUMES (cm^3)
+  bottom                    440.3
+  top                       304.7
+  collar_0                   13.1
+  collar_1                   13.1
+  collar_2                   13.1
+  collar_3                   13.1
+  total 797 cm^3 -> 7.2 / 8.8 / 10.0 kg at 9 / 11 / 12.5 g/cm^3 packed density
+INTERFERENCE (mm^3, should all be ~0)
+  bottom_tub x cross: 0.000
+  top_tub x cross: 0.000
+  bottom_lid x cross: 0.000
+  top_lid x cross: 0.000
+  collar_quarter_0 x cross: 0.000
+  collar_cap_0 x cross: 0.000
+  collar_quarter_1 x cross: 0.000
+  collar_cap_1 x cross: 0.000
+  collar_quarter_2 x cross: 0.000
+  collar_cap_2 x cross: 0.000
+  collar_quarter_3 x cross: 0.000
+  collar_cap_3 x cross: 0.000
+ASSEMBLY MOTION (max overlap with the cross along the path, mm^3)
+  bottom tub + lid, straight down 150: 0.000
+  top tub + lid, straight up 150 (past Z flange and collars): 0.000
+  collar quarter, lifted 5 then out along the x = y diagonal 120 (top tub off): 0.000
+MIN PLASTIC BETWEEN POWDER AND THE OUTSIDE OF ITS OWN TUB (mm)
+  bottom               1.20
+  top                  1.20
+  collar_0             1.60
+RAY TRACE from the centre, 40000 directions uniform over the sphere
+   14.9 % of directions leave through a port opening (no shield possible)
+   41.0 % see >= 25.40 mm of powder
+   46.7 % see >= 22.00 mm of powder
+   51.5 % see >= 19.00 mm of powder
+   61.4 % see >= 12.70 mm of powder
+   68.0 % see >=  6.00 mm of powder
+   72.9 % see >=  0.01 mm of powder
+  by angle from the nearest arm axis (median / min powder path, mm):
+    20-25 deg:   0.0 /   0.0   ( 8.4 % of sphere)
+    25-30 deg:   2.2 /   0.0   (10.0 % of sphere)
+    30-35 deg:  13.9 /   0.0   (11.7 % of sphere)
+    35-40 deg:  21.7 /   0.0   (13.3 % of sphere)
+    40-45 deg:  30.4 /   9.0   (14.7 % of sphere)
+    45-55 deg:  39.8 /  12.6   (14.8 % of sphere)
+    55-90 deg:  32.1 /  27.6   (12.0 % of sphere)
+  straight down (within 20 deg of -Z): median 28.6, min 27.6 mm
+  more than 40 deg from every arm (41.5 % of sphere): median 33.8 mm, 93 % >= 25.4, 98 % >= 19, 100 % >= 12.7
+  thinnest directions more than 40 deg from every arm (azimuth, elevation, mm):
+    az   129.6  el   -7.1    9.0
+    az    39.8  el   -7.2    9.5
+    az   -91.1  el   50.0   10.4
+    az  -130.1  el   -7.2   10.4
+    az   -40.4  el   -7.1   10.5
+    az     1.5  el   49.9   10.6
+    az   140.1  el   -7.3   10.7
+    az   179.1  el   49.8   10.8
+    az    50.4  el   -7.5   10.9
+    az   -88.2  el   49.7   11.0
+    az    49.3  el   -7.0   11.0
+    az    89.4  el   49.7   11.1

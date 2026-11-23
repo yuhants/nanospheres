@@ -52,6 +52,7 @@ class ChannelConfig:
     coupling: str = 'DC'        # 'DC' or 'AC'
     analog_offset: float = 0.0
     save_mean_only: bool = False # if True, write channel mean (mV) instead of full waveform
+    slow: bool = False           # inherently slow input: kept as a slow series (slow_data.py)
 
 
 @dataclass
@@ -261,7 +262,7 @@ class PicoscopeDAQ:
     # ── Acquisition ─────────────────────────────────────────────────────────────
 
     def acquire_one(self, on_chunk=None, chunk_period: float = 0.5,
-                    window_duration: float = 2.0):
+                    window_duration: float = 2.0, on_samples=None):
         """
         Stream one capture.
 
@@ -282,6 +283,13 @@ class PicoscopeDAQ:
             How often to call on_chunk, in seconds of acquired data (default 0.5).
         window_duration : float
             How many seconds of history to include in each on_chunk call (default 2.0).
+        on_samples : callable, optional
+            ``on_samples(block, stable)`` — called from the streaming callback
+            with every new run of samples, in order and without gaps: an int16
+            view of shape (n_channels, n).  ``stable`` is True here: the view is
+            into this capture's own buffer and stays valid.  It must return
+            immediately (enqueue, do not compute) — this is the tap the slow-data
+            reduction hangs off (see slow_data.SlowPipeline.push).
 
         Returns
         -------
@@ -332,6 +340,8 @@ class PicoscopeDAQ:
             state['next_sample'] += noOfSamples
             if autoStop:
                 state['auto_stop'] = True
+            if on_samples is not None and noOfSamples > 0:
+                on_samples(state['total_buffer'][:, dst:dst + noOfSamples], True)
 
             # ── Semi-realtime preview hook ────────────────────────────────────
             if on_chunk is not None:
@@ -388,7 +398,8 @@ class PicoscopeDAQ:
     def monitor_stream(self, on_window, ring_duration: float = 1.0,
                        update_period: float = 0.2, chunk_duration: float = 0.05,
                        should_stop=None, max_ring_samples: int = 2 ** 24,
-                       stall_timeout: float = 5.0) -> None:
+                       stall_timeout: float = 5.0, on_samples=None,
+                       burst: bool = False, on_burst=None) -> None:
         """
         Stream continuously without autostop and hand rolling windows to a callback.
 
@@ -428,6 +439,28 @@ class PicoscopeDAQ:
         max_ring_samples : int
             Per-channel cap on the ring, so a long window at a high sample rate
             cannot exhaust memory.
+        on_samples : callable, optional
+            ``on_samples(block, stable)`` — as in acquire_one(), every sample in
+            order, but ``stable`` is False: the view is into the driver's chunk
+            buffer and is overwritten by the next callback, so the receiver must
+            copy it before returning.
+
+        burst : bool
+            Instead of one endless stream, take a bounded capture of
+            ``ring_duration`` every ``update_period`` and stop in between.
+
+            An endless stream has to get every sample across USB as fast as it
+            is taken.  Several channels at MS/s exceed what a USB 2.0 link
+            carries; the scope's memory hides the deficit for some tens of
+            seconds and then the driver returns torn data (a comb in the PSD,
+            a thickened trace).  A bounded capture is buffered in the scope and
+            drained afterwards — the way acquire_one() works — so each burst is
+            a clean, full-rate window at any channel count, at the price of
+            dead time between them.
+        on_burst : callable, optional
+            ``on_burst('start', t_wall)`` before each burst's first sample and
+            ``on_burst('end', t_wall)`` after its last, so a consumer of
+            ``on_samples`` knows where the stream is not contiguous.
 
         Returns when ``should_stop()`` becomes true, or early if the driver stops
         delivering callbacks for ``stall_timeout`` seconds (the caller is expected
@@ -456,16 +489,23 @@ class PicoscopeDAQ:
             'filled':          0,      # valid samples in the ring
             'overflow':        0,
             'was_called_back': False,
+            'received':        0,      # samples in the current burst
+            'auto_stop':       False,
         }
 
         def _monitor_callback(handle, noOfSamples, startIndex, overflow,
                               triggerAt, triggered, autoStop, param):
             state['was_called_back'] = True
+            if autoStop:
+                state['auto_stop'] = True
             if noOfSamples <= 0:
                 return
             state['overflow'] |= overflow
+            state['received'] += noOfSamples
             src = mon_buffer[:, startIndex:startIndex + noOfSamples]
             n   = src.shape[1]
+            if on_samples is not None:
+                on_samples(src, False)
             if n >= window_samples:
                 ring[:, :] = src[:, -window_samples:]
                 state['ptr']    = 0
@@ -505,41 +545,81 @@ class PicoscopeDAQ:
 
         self._register_buffers(mon_buffer)
         c_interval = ctypes.c_int32(cfg.sample_interval)
+        c_func_ptr = ps.StreamingReadyType(_monitor_callback)
 
-        # autoStop=0 → the driver recycles the chunk buffer indefinitely.
-        self._status['runStreamingMonitor'] = ps.ps4000aRunStreaming(
-            self._chandle,
-            ctypes.byref(c_interval),
-            ps.PS4000A_TIME_UNITS[cfg.sample_units],
-            0,               # maxPreTriggerSamples
-            chunk_samples,   # maxPostTriggerSamples (ignored while autoStop is off)
-            0,               # autoStopOn
-            1,               # downsampleRatio
-            ps.PS4000A_RATIO_MODE['PS4000A_RATIO_MODE_NONE'],
-            chunk_samples,
-        )
-        assert_pico_ok(self._status['runStreamingMonitor'])
-        actual_dt = c_interval.value * TIME_UNITS_SEC[cfg.sample_units]
+        def _run_streaming(auto_stop: bool) -> float:
+            # autoStop=0 → the driver recycles the chunk buffer indefinitely;
+            # autoStop=1 → it stops by itself after window_samples (one burst).
+            self._status['runStreamingMonitor'] = ps.ps4000aRunStreaming(
+                self._chandle,
+                ctypes.byref(c_interval),
+                ps.PS4000A_TIME_UNITS[cfg.sample_units],
+                0,               # maxPreTriggerSamples
+                window_samples if auto_stop else chunk_samples,
+                1 if auto_stop else 0,
+                1,               # downsampleRatio
+                ps.PS4000A_RATIO_MODE['PS4000A_RATIO_MODE_NONE'],
+                chunk_samples,
+            )
+            assert_pico_ok(self._status['runStreamingMonitor'])
+            return c_interval.value * TIME_UNITS_SEC[cfg.sample_units]
 
-        c_func_ptr  = ps.StreamingReadyType(_monitor_callback)
+        def _poll() -> None:
+            state['was_called_back'] = False
+            self._status['getStreamingLatestValues'] = st = (
+                ps.ps4000aGetStreamingLatestValues(self._chandle, c_func_ptr, None))
+            if st != 0:
+                # PICO_BUFFER_STALL (28) here means the driver had nowhere to
+                # put samples and threw some away; whatever arrives next is
+                # discontinuous.  Counting these by name is what turns "the
+                # trace looks wrong" into a number.
+                name = PICO_STATUS_LOOKUP.get(st, f'status={st}')
+                self.stream_events[name] = self.stream_events.get(name, 0) + 1
+            if not state['was_called_back']:
+                time.sleep(0.005)
+
+        def _stopping() -> bool:
+            return bool(should_stop and should_stop())
+
         min_samples = max(chunk_samples, int(0.01 / nominal_dt))
-        last_emit   = 0.0
-        last_data   = time.perf_counter()
         try:
-            while not (should_stop and should_stop()):
-                state['was_called_back'] = False
-                self._status['getStreamingLatestValues'] = st = (
-                    ps.ps4000aGetStreamingLatestValues(self._chandle, c_func_ptr, None))
-                if st != 0:
-                    # PICO_BUFFER_STALL (28) here means the driver had nowhere to
-                    # put samples and threw some away; whatever arrives next is
-                    # discontinuous.  Counting these by name is what turns "the
-                    # trace looks wrong" into a number.
-                    name = PICO_STATUS_LOOKUP.get(st, f'status={st}')
-                    self.stream_events[name] = self.stream_events.get(name, 0) + 1
-                if not state['was_called_back']:
-                    time.sleep(0.005)
+            if burst:
+                while not _stopping():
+                    state.update(ptr=0, filled=0, received=0, auto_stop=False)
+                    burst_t0 = time.perf_counter()
+                    if on_burst is not None:
+                        on_burst('start', time.time())
+                    actual_dt = _run_streaming(True)
+                    last_data = time.perf_counter()
+                    while (state['received'] < window_samples
+                           and not state['auto_stop'] and not _stopping()):
+                        _poll()
+                        now = time.perf_counter()
+                        if state['was_called_back']:
+                            last_data = now
+                        elif now - last_data > stall_timeout:
+                            return
+                    self._safe_stop()
+                    if on_burst is not None:
+                        on_burst('end', time.time())
+                    if _stopping():
+                        break
+                    if state['filled'] > 0:
+                        overflow = state['overflow']
+                        state['overflow'] = 0
+                        on_window(_snapshot, adc2mvs, actual_dt, overflow)
+                    # Idle out the rest of the period in small steps, so a stop
+                    # request is still answered within milliseconds.
+                    while (time.perf_counter() - burst_t0 < update_period
+                           and not _stopping()):
+                        time.sleep(0.005)
+                return
 
+            actual_dt = _run_streaming(False)
+            last_emit = 0.0
+            last_data = time.perf_counter()
+            while not _stopping():
+                _poll()
                 now = time.perf_counter()
                 if state['was_called_back']:
                     last_data = now
@@ -564,7 +644,8 @@ class PicoscopeDAQ:
     def write_hdf5(self, filepath: str, timestamp: float, dt: float,
                    adc2mvs: np.ndarray, data: np.ndarray,
                    pressure_mbar: Optional[float] = None,
-                   extra_attrs: Optional[dict] = None) -> None:
+                   extra_attrs: Optional[dict] = None,
+                   slow: Optional[dict] = None) -> None:
         """
         Write one capture to HDF5 using the standard lab format.
 
@@ -580,6 +661,10 @@ class PicoscopeDAQ:
         ``extra_attrs`` adds further attributes to /data — used to record the
         calibration-pulse settings in force for the file, so the amplitude does
         not have to be recovered from the filename.
+
+        ``slow`` is the result of SlowPipeline.end() for this capture: the slow
+        quantities reduced from these very samples, written as the group /slow
+        (layout in slow_data.py) so they travel with the waveform.
         """
         with h5py.File(filepath, 'w') as f:
             g = f.create_group('data')
@@ -605,3 +690,9 @@ class PicoscopeDAQ:
                     ds = g.create_dataset(
                         f'channel_{ch.name.lower()}', data=data[i], dtype=np.int16)
                     ds.attrs['adc2mv'] = float(adc2mvs[i])
+            if slow is not None:
+                try:
+                    from .slow_data import write_slow_group
+                except ImportError:         # picoscope_daq imported as a script
+                    from slow_data import write_slow_group
+                write_slow_group(f, slow)

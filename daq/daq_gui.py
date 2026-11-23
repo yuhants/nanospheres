@@ -35,6 +35,16 @@ into each file's HDF5 attributes.  That is dm_search/impulse_calibration.py with
 the DAQ, not a clock, driving the loop.  Without the pulse generator connected
 the tab is inert and everything else behaves exactly as before.
 
+Slow inputs (a lock-in amplifier's output, a temperature sensor) share the scope
+with the fast ones: a channel whose Save mode is "Slow" is averaged down to a
+few rows a second in both modes, shown on a strip chart under the fast plots,
+written into each recorded file (/slow) and optionally to a continuous log that
+spans monitoring and recording (slow_data.py, slow_panel.py).
+
+The monitor can stream endlessly or take bursts (see "Monitor stream"): several
+channels at MS/s outrun a USB 2.0 link, and an endless stream then breaks up
+after some tens of seconds, where bursts stay clean.
+
 The "Inspect" tab reads files back off disk: browse a directory, plot a capture
 in time and frequency, read its metadata.  It draws through the same
 prepare_display/DaqPlotCanvas path as the live view, so a file looks the way it
@@ -103,6 +113,10 @@ from daq.picoscope_daq import (
     CHANNEL_INPUT_RANGES_MV, RANGE_LABELS, TIME_UNITS_SEC, PICO_SERIALS,
 )
 
+from daq.slow_data import (
+    SlowConfig, SlowPipeline, SlowHistory, SlowLogWriter, slow_columns)
+from daq.slow_panel import SlowSettingsPanel, SlowPlotCanvas
+
 try:
     from control.src.agilent_twisstorr_84fsag_control import read_pressure as _hw_read_pressure
     _HAS_PRESSURE = True
@@ -126,6 +140,11 @@ YLIM_OPTIONS       = ['auto', 'full range', 'manual', 'mV/div']
 _MPL_COLOURS       = {f'C{i}': c for i, c in enumerate(
     matplotlib.rcParams['axes.prop_cycle'].by_key().get('color', []))}
 PSD_YLIM_OPTIONS   = ['auto', 'manual']
+# Sustained streaming the link can carry, in bytes per second (2 per sample per
+# channel).  The USB 2.0 figure is measured on this setup (~25 MB/s, with
+# margin); the USB 3.0 one is deliberately conservative.
+USB2_STREAM_LIMIT  = 20e6
+USB3_STREAM_LIMIT  = 120e6
 
 
 def _fmt_range(range_mv: int) -> str:
@@ -526,14 +545,27 @@ class MonitorWorker(QThread):
     """
     frame_ready = pyqtSignal(dict, bool)   # display dict, psd_updated
     status      = pyqtSignal(str)          # over-range / rate line
+    slow_rows   = pyqtSignal(object)       # (columns, units, times, values)
     done        = pyqtSignal()
     error       = pyqtSignal(str)
 
     def __init__(self, daq: PicoscopeDAQ, refresh: float, time_span: float,
                  psd_span: float, chunk: float, display_opts: DisplayOptions,
-                 psd_average: int = 1, psd_refresh: float = 0.3):
+                 psd_average: int = 1, psd_refresh: float = 0.3,
+                 slow_config: Optional[SlowConfig] = None,
+                 slow_tracked: Optional[dict] = None,
+                 burst: bool = False):
         super().__init__()
         self._daq   = daq
+        self._burst = burst
+        # Slow data is reduced from every sample on a thread of its own (see
+        # slow_data.SlowPipeline) — independent of the display path below, which
+        # only ever looks at the newest window and drops the rest.
+        self._slow: Optional[SlowPipeline] = None
+        if slow_config is not None and slow_config.enabled:
+            self._slow = SlowPipeline(
+                slow_config, on_rows=lambda *rows: self.slow_rows.emit(rows),
+                tracked=slow_tracked)
         self._lock  = threading.Lock()
         self._stop_requested = False
         self._restart        = False
@@ -589,16 +621,21 @@ class MonitorWorker(QThread):
 
     def apply_settings(self, refresh: float, time_span: float, psd_span: float,
                        chunk: float, display_opts: DisplayOptions,
-                       psd_average: int, psd_refresh: float) -> None:
+                       psd_average: int, psd_refresh: float,
+                       burst: Optional[bool] = None) -> None:
         """Push new settings in; restart the stream only if the ring must resize."""
         with self._lock:
+            if burst is None:
+                burst = self._burst
             geometry_changed = (time_span != self._time_span
+                                or burst    != self._burst
                                 or psd_span != self._psd_span
                                 or chunk    != self._chunk
                                 or refresh  != self._refresh)
             average_changed  = psd_average != self._psd_average
             psd_shape_changed = display_opts.nperseg != self._opts.nperseg
             self._refresh     = refresh
+            self._burst       = burst
             self._time_span   = time_span
             self._psd_span    = psd_span
             self._chunk       = chunk
@@ -629,21 +666,41 @@ class MonitorWorker(QThread):
                     # A driver chunk longer than the refresh interval would cap
                     # the frame rate at the chunk rate, so keep it under.
                     chunk    = min(self._chunk, refresh)
+                    burst    = self._burst
+                if burst:
+                    # A burst is the whole ring, so the ring is exactly what the
+                    # display uses; the chunk is only the transfer granularity.
+                    chunk = min(self._chunk, ring)
                 self._last_psd = 0.0
                 self._fps_t0   = time.perf_counter()
                 self._frames   = 0
-                self._daq.monitor_stream(
-                    on_window=self._on_window,
-                    ring_duration=ring,
-                    update_period=refresh,
-                    chunk_duration=chunk,
-                    should_stop=lambda: self._stop_requested or self._restart,
-                )
+                slow = self._slow
+                if slow is not None:
+                    cfg = self._daq.config
+                    slow.begin(time.time(), cfg.dt,
+                               [ch.name for ch in cfg.channels],
+                               self._daq._adc2mv_factors())
+                try:
+                    self._daq.monitor_stream(
+                        on_window=self._on_window,
+                        ring_duration=ring,
+                        update_period=refresh,
+                        chunk_duration=chunk,
+                        should_stop=lambda: self._stop_requested or self._restart,
+                        on_samples=slow.push if slow is not None else None,
+                        burst=burst,
+                        on_burst=slow.mark_burst if slow is not None else None,
+                    )
+                finally:
+                    if slow is not None:
+                        slow.end(timeout=5.0)
             self.done.emit()
         except Exception as exc:
             self.error.emit(str(exc))
         finally:
             self._stop_requested = True
+            if self._slow is not None:
+                self._slow.close()
             with self._pending_cv:
                 self._pending_cv.notify_all()
             if self._render_thread is not None:
@@ -760,10 +817,17 @@ class MonitorWorker(QThread):
             self._fps_t0 = now
 
         over = [ch.name for i, ch in enumerate(channels) if overflow & (1 << i)]
-        msg  = (f'Monitoring — {_fmt_duration(window.shape[1] * dt)} @ '
-                f'{_fmt_rate(1 / dt)} · {self._fps:.0f} fps')
+        msg  = (f'Monitoring{" (sweeps)" if self._burst else ""} — '
+                f'{_fmt_duration(window.shape[1] * dt)} @ '
+                f'{_fmt_rate(1 / dt)} · {self._fps:.3g} fps')
         if self._dropped:
             msg += f' · {self._dropped} dropped'
+        if self._slow is not None:
+            if self._slow.error:
+                msg += f'   ⚠ SLOW DATA: {self._slow.error}'
+            elif self._slow.dropped_samples:
+                msg += (f'   ⚠ slow data behind — '
+                        f'{self._slow.dropped_samples * dt:.1f} s skipped')
         health = self._daq.stream_health
         if health:
             # The driver losing samples is the one failure that looks like a
@@ -832,6 +896,7 @@ class AcquisitionWorker(QThread):
     progress      = pyqtSignal(int, int, float)
     pulse_changed = pyqtSignal(int, float)
     message       = pyqtSignal(str)
+    slow_rows     = pyqtSignal(object)        # (columns, units, times, values)
     done          = pyqtSignal()              # avoid shadowing QThread.finished
     error         = pyqtSignal(str)
 
@@ -840,8 +905,19 @@ class AcquisitionWorker(QThread):
                  display_opts: DisplayOptions, chunk_period: float = 0.5,
                  window_duration: float = 2.0, sequencer=None,
                  tag_filenames: bool = True, restart_index: bool = True,
-                 pulse_attrs: Optional[dict] = None):
+                 pulse_attrs: Optional[dict] = None,
+                 slow_config: Optional[SlowConfig] = None,
+                 slow_embed: bool = True,
+                 slow_tracked: Optional[dict] = None):
         super().__init__()
+        # Same reduction as in monitor mode, fed from the capture buffer.  The
+        # rows of each file are also written into that file (slow_embed).
+        self._slow: Optional[SlowPipeline] = None
+        self._slow_embed = slow_embed
+        if slow_config is not None and slow_config.enabled:
+            self._slow = SlowPipeline(
+                slow_config, on_rows=lambda *rows: self.slow_rows.emit(rows),
+                tracked=slow_tracked)
         self._daq              = daq
         self._file_directory   = file_directory
         self._file_prefix      = file_prefix
@@ -903,17 +979,34 @@ class AcquisitionWorker(QThread):
                     except Exception:
                         pressure = -1.0
 
-                timestamp, dt, adc2mvs, data = self._daq.acquire_one(
-                    on_chunk=self._on_preview_chunk,
-                    chunk_period=self._chunk_period,
-                    window_duration=self._window_duration,
-                )
+                slow = self._slow
+                if slow is not None:
+                    cfg = self._daq.config
+                    slow.begin(time.time(), cfg.dt,
+                               [ch.name for ch in cfg.channels],
+                               self._daq._adc2mv_factors())
+                slow_result = None
+                try:
+                    timestamp, dt, adc2mvs, data = self._daq.acquire_one(
+                        on_chunk=self._on_preview_chunk,
+                        chunk_period=self._chunk_period,
+                        window_duration=self._window_duration,
+                        on_samples=slow.push if slow is not None else None,
+                    )
+                finally:
+                    if slow is not None:
+                        # Waits for the reducer to finish this file's samples;
+                        # it runs alongside the capture, so this is short.
+                        slow_result = slow.end(timeout=60.0)
+                        if slow.error:
+                            self.message.emit(f'slow data: {slow.error}')
 
                 fname = f'{self._file_prefix}{tag}{index}.hdf5'
                 self._daq.write_hdf5(
                     os.path.join(self._file_directory, fname),
                     timestamp, dt, adc2mvs, data, pressure,
                     extra_attrs=attrs or None,
+                    slow=slow_result if self._slow_embed else None,
                 )
 
                 # Whole-file PSD: same code path as the preview, but with the
@@ -938,6 +1031,8 @@ class AcquisitionWorker(QThread):
                     self._sequencer.finish()
                 except Exception as exc:
                     self.message.emit(f'pulse shutdown failed: {exc}')
+            if self._slow is not None:
+                self._slow.close()
 
     def _on_preview_chunk(self, window: np.ndarray,
                           adc2mvs: np.ndarray, dt: float) -> None:
@@ -2671,8 +2766,20 @@ class DaqMainWindow(QMainWindow):
         self._syncing_rate                                   = False
         self._config_dirty                                   = False
 
+        self._slow_history                                   = SlowHistory()
+        self._slow_log:          Optional[SlowLogWriter]     = None
+        self._slow_config:       Optional[SlowConfig]        = None
+        self._slow_dirty                                     = False
+        self._slow_tracked:      dict                        = {}
+
         self._elapsed_timer = QTimer(self)
         self._elapsed_timer.timeout.connect(self._tick_elapsed)
+        # The strip chart is redrawn on a timer rather than per row: rows can
+        # arrive in bursts, and a full redraw each time would steal the GUI
+        # thread from the fast canvas.
+        self._slow_timer = QTimer(self)
+        self._slow_timer.timeout.connect(self._draw_slow)
+        self._slow_timer.start(400)
 
         self._build_ui()
         self._on_interval_edited()       # seed the rate spin from the default interval
@@ -2717,6 +2824,13 @@ class DaqMainWindow(QMainWindow):
         # are a different instrument, and most runs do not use them.
         left = QTabWidget()
         left.addTab(scroll, 'Acquisition')
+        self._slow_panel = SlowSettingsPanel()
+        self._slow_panel.apply_requested.connect(self._on_slow_apply)
+        self._slow_panel.view_changed.connect(self._on_slow_view_changed)
+        self._slow_panel.clear_requested.connect(self._on_slow_clear)
+        self._slow_panel.new_log_requested.connect(self._on_slow_new_log)
+        self._slow_panel.log_toggled.connect(self._sync_slow_log)
+        left.addTab(self._slow_panel, 'Slow data')
         if _HAS_PULSES:
             left.addTab(self._build_pulse_tab(), 'Pulses')
         left.setMinimumWidth(430)
@@ -2730,7 +2844,17 @@ class DaqMainWindow(QMainWindow):
         self._canvas.zoom_changed.connect(self._on_zoom_changed)
         self._toolbar = NavigationToolbar2QT(self._canvas, self)
         right_layout.addWidget(self._toolbar)
-        right_layout.addWidget(self._canvas)
+        # Fast plots above, slow strip chart below; the chart only takes room
+        # once slow data is switched on.
+        self._slow_canvas = SlowPlotCanvas()
+        self._slow_canvas.setVisible(False)
+        self._plot_splitter = QSplitter(Qt.Vertical)
+        self._plot_splitter.addWidget(self._canvas)
+        self._plot_splitter.addWidget(self._slow_canvas)
+        self._plot_splitter.setStretchFactor(0, 3)
+        self._plot_splitter.setStretchFactor(1, 2)
+        self._plot_splitter.setChildrenCollapsible(False)
+        right_layout.addWidget(self._plot_splitter, 1)
         right_layout.addWidget(self._build_measurement_strip())
         right_layout.addWidget(self._build_history_bar())
 
@@ -2802,9 +2926,16 @@ class DaqMainWindow(QMainWindow):
             coupling_cb = QComboBox()
             coupling_cb.addItems(['DC', 'AC'])
             save_cb     = QComboBox()
-            save_cb.addItems(['Full', 'Mean'])
-            save_cb.setToolTip('How this channel is written to file when recording '
-                               '(no effect while monitoring)')
+            save_cb.addItems(['Full', 'Mean', 'Slow'])
+            save_cb.setToolTip(
+                'How this channel is kept.\n'
+                'Full — the waveform, in every recorded file.\n'
+                'Mean — one number per file.\n'
+                'Slow — for an input that is itself slow (lock-in output,\n'
+                '  temperature…): averaged to the slow-data rate, plotted on the\n'
+                '  strip chart while monitoring and recording, and written as a\n'
+                '  slow series instead of a waveform (see the Slow data tab).')
+            save_cb.currentIndexChanged.connect(self._mark_config_dirty)
 
             enable.stateChanged.connect(self._mark_config_dirty)
             range_cb.currentIndexChanged.connect(self._mark_config_dirty)
@@ -3107,6 +3238,22 @@ class DaqMainWindow(QMainWindow):
             tip='Driver callback granularity (monitor mode).\n'
                 'Lower = lower latency, more overhead.')
 
+        self._stream_combo = QComboBox()
+        self._stream_combo.addItems(['Auto', 'Roll (continuous)', 'Sweeps (scope)'])
+        self._stream_combo.setToolTip(
+            'How the monitor gets its data.\n'
+            'Roll — one endless stream; smooth rolling trace, but every\n'
+            '  sample must cross USB in real time.  Channels × rate beyond what\n'
+            '  the link carries (about 20 MB/s on a USB 2.0 port, i.e. 2 channels\n'
+            '  at 5 MS/s) looks fine for some tens of seconds and then breaks up:\n'
+            '  thick traces and a comb of lines in the PSD.\n'
+            'Sweeps — what a bench scope (and the PicoScope application) does\n'
+            '  at fast timebases: capture one screenful at full rate into the\n'
+            '  scope\'s own memory, transfer it, draw it, re-arm.  Clean at any\n'
+            '  channel count and rate; the signal between sweeps is not seen.\n'
+            'Auto — roll while the link can carry it, sweeps beyond that.')
+        self._stream_combo.currentIndexChanged.connect(self._push_live_settings)
+
         self._nperseg_combo = QComboBox()
         self._nperseg_combo.addItems(NPERSEG_OPTIONS)
         self._nperseg_combo.setToolTip('Welch segment length (auto ≈ fs/10, capped at 65536)')
@@ -3175,6 +3322,7 @@ class DaqMainWindow(QMainWindow):
             ('PSD nperseg:',  self._nperseg_combo),
             ('PSD average:',  self._psdavg_spin),
             ('Stream chunk:', self._chunk_spin),
+            ('Monitor stream:', self._stream_combo),
             ('History:',      self._depth_spin),
         ]
         for i, (label, widget) in enumerate(rows):
@@ -3600,9 +3748,26 @@ class DaqMainWindow(QMainWindow):
                 display_opts=self._display_options(),
                 psd_average=self._psdavg_spin.value(),
                 psd_refresh=self._psd_refresh_spin.value(),
+                burst=self._monitor_burst(),
             )
         if self._worker is not None and self._worker.isRunning():
             self._worker.apply_display_options(self._record_display_options())
+
+    def _monitor_burst(self) -> bool:
+        """
+        Whether the monitor should take bursts rather than stream endlessly.
+
+        In Auto this is decided by arithmetic, not by watching for damage: the
+        failure of an over-driven continuous stream is silent for the first tens
+        of seconds and looks like signal afterwards.
+        """
+        mode = self._stream_combo.currentText()
+        if mode != 'Auto' or self._daq is None:
+            return mode.startswith('Sweeps')
+        cfg    = self._daq.config
+        demand = len(cfg.channels) * cfg.fs * 2            # bytes per second
+        usb2   = self._daq.connect_status == 'PICO_USB3_0_DEVICE_NON_USB3_0_PORT'
+        return demand > (USB2_STREAM_LIMIT if usb2 else USB3_STREAM_LIMIT)
 
     def _on_view_changed(self) -> None:
         self._canvas.set_view_options(self._view_options())
@@ -3705,6 +3870,7 @@ class DaqMainWindow(QMainWindow):
             except Exception:
                 pass
             self._daq = None
+        self._close_slow_log()
         self._hide_display_checkboxes()
         self._mode = 'idle'
         self._mode_label.setText('Disconnected')
@@ -3799,7 +3965,11 @@ class DaqMainWindow(QMainWindow):
             display_opts=self._display_options(),
             psd_average=self._psdavg_spin.value(),
             psd_refresh=self._psd_refresh_spin.value(),
+            slow_config=self._prepare_slow(),
+            slow_tracked=self._slow_tracked,
+            burst=self._monitor_burst(),
         )
+        self._monitor.slow_rows.connect(self._on_slow_rows)
         self._monitor.frame_ready.connect(self._on_monitor_frame)
         self._monitor.status.connect(self._mode_label.setText)
         self._monitor.error.connect(self._on_monitor_error)
@@ -3844,6 +4014,8 @@ class DaqMainWindow(QMainWindow):
         pending, self._pending = self._pending, None
         if pending == 'record':
             self._start_recording()
+        elif pending == 'restart_monitor':
+            self._start_monitor()
         elif pending == 'apply_and_monitor':
             if self._apply_config_now():
                 self._start_monitor()
@@ -3896,7 +4068,13 @@ class DaqMainWindow(QMainWindow):
             tag_filenames=(_HAS_PULSES and self._pulse_tag_check.isChecked()),
             restart_index=(_HAS_PULSES and self._pulse_restart_check.isChecked()),
             pulse_attrs=pulse_attrs,
+            slow_config=self._prepare_slow(),
+            slow_embed=self._slow_panel.embed_in_files(),
+            slow_tracked=self._slow_tracked,
         )
+        self._worker.slow_rows.connect(self._on_slow_rows)
+        self._worker.message.connect(self._on_worker_message)
+        self._slow_panel.set_busy(True)
         # Remembered for _on_finished: per-amplitude numbering means the start
         # index must not drift, since each amplitude counts from it afresh.
         self._index_restarted = (sequencer is not None and _HAS_PULSES
@@ -3984,6 +4162,7 @@ class DaqMainWindow(QMainWindow):
         self._worker = None
         self._mode = 'idle'
         self._elapsed_timer.stop()
+        self._slow_panel.set_busy(False)
         self._release_pulses()
         self._mode_label.setText(f'Run finished — {self._files_written} files')
         self._update_buttons()
@@ -4004,10 +4183,158 @@ class DaqMainWindow(QMainWindow):
         self._worker = None
         self._mode = 'idle'
         self._elapsed_timer.stop()
+        self._slow_panel.set_busy(False)
         self._release_pulses()
         self._mode_label.setText('Acquisition error')
         self._update_buttons()
         QMessageBox.critical(self, 'Acquisition error', msg)
+
+    # ── Slow data ───────────────────────────────────────────────────────────────
+
+    def _prepare_slow(self) -> Optional[SlowConfig]:
+        """
+        Get the chart, the history and the log ready for a stream that is about
+        to start, and return the configuration its worker should reduce with
+        (None when slow data is off).
+
+        The columns are fixed for a stream.  If they differ from what the
+        history holds, the history starts over and so does the log file — rows
+        of two different shapes cannot share either.
+        """
+        config = self._slow_panel.config()
+        if self._daq is not None:
+            config.slow_channels = [ch.name for ch in self._daq.config.channels
+                                    if ch.slow]
+            # A channel marked Slow is a request for slow data in itself.
+            config.enabled = config.enabled or bool(config.slow_channels)
+        self._show_slow_canvas(config.enabled)
+        if not config.enabled or self._daq is None:
+            self._slow_panel.set_status('')
+            return None
+        names = [ch.name for ch in self._daq.config.channels]
+        self._slow_panel.set_sample_period(self._daq.config.dt)
+        columns, units = slow_columns(config, names)
+
+        skipped = [lk.name for lk in config.lockins
+                   if f'{lk.name}_x' not in columns]
+        if not columns:
+            self._slow_panel.set_status(
+                '⚠ nothing to compute — set a channel\'s Save mode to "Slow" '
+                '(then Apply settings), or tick the statistics')
+            return None
+        self._slow_panel.set_status(
+            f'⚠ skipped (channel not enabled, or duplicate name): '
+            f'{", ".join(skipped)}' if skipped else
+            f'{len(columns)} series at {config.rate_hz:g} Hz')
+
+        if columns != self._slow_history.columns or (
+                self._slow_config is not None
+                and config.to_dict() != self._slow_config.to_dict()):
+            # A changed rate, frequency or scale keeps the column names but not
+            # their meaning, so the log starts a new file for it too.
+            self._close_slow_log()
+        if columns != self._slow_history.columns:
+            self._slow_history.reset(columns, units)
+            self._slow_panel.set_columns(columns, units)
+        self._slow_history.units = dict(units)
+        self._slow_history.set_capacity(self._slow_panel.keep_points())
+        self._slow_config = config
+        self._sync_slow_log(starting=True)
+        return config
+
+    def _sync_slow_log(self, starting: bool = False) -> None:
+        """
+        Open or close the continuous log to match the checkbox.
+
+        A file is only opened when rows are about to arrive (a stream starting,
+        or the box ticked mid-stream), so ticking it while idle does not litter
+        the output directory with empty files.
+        """
+        if not self._slow_panel.log_enabled():
+            self._close_slow_log()
+            return
+        if self._slow_log is not None or not self._slow_history.columns:
+            return
+        if not starting and self._mode == 'idle':
+            self._slow_panel.set_log_text('logging starts with the next stream')
+            return
+        if self._slow_config is None:
+            return
+        directory = self._dir_edit.text().strip()
+        try:
+            os.makedirs(directory, exist_ok=True)
+            stamp = time.strftime('%Y%m%d_%H%M%S')
+            path = os.path.join(
+                directory, f'{self._prefix_edit.text()}slow_{stamp}.hdf5')
+            self._slow_log = SlowLogWriter(
+                path, self._slow_history.columns, self._slow_history.units,
+                self._slow_config)
+            self._slow_panel.set_log_text(f'logging to {path}')
+        except Exception as exc:
+            self._slow_log = None
+            self._slow_panel.set_log_text(f'⚠ cannot open a log file: {exc}')
+
+    def _close_slow_log(self) -> None:
+        if self._slow_log is not None:
+            path, rows = self._slow_log.path, self._slow_log.n_rows
+            try:
+                self._slow_log.close()
+            except Exception:
+                pass
+            self._slow_log = None
+            self._slow_panel.set_log_text(f'closed {path} ({rows} rows)')
+
+    def _on_slow_new_log(self) -> None:
+        self._close_slow_log()
+        self._sync_slow_log()
+
+    def _on_slow_apply(self) -> None:
+        """New reduction settings: restart the monitor so they take hold."""
+        if self._mode == 'monitor':
+            self._stop_monitor_then('restart_monitor')
+        elif self._mode == 'idle':
+            self._show_slow_canvas(self._slow_panel.config().enabled)
+
+    def _show_slow_canvas(self, show: bool) -> None:
+        if show and not self._slow_canvas.isVisible():
+            self._slow_canvas.setVisible(True)
+            total = max(sum(self._plot_splitter.sizes()), 300)
+            self._plot_splitter.setSizes([int(total * 0.62), int(total * 0.38)])
+        elif not show:
+            self._slow_canvas.setVisible(False)
+
+    def _on_slow_rows(self, payload) -> None:
+        columns, _units, times, values = payload
+        if list(columns) != self._slow_history.columns:
+            return                      # left over from the previous configuration
+        self._slow_history.append(times, values)
+        if self._slow_log is not None:
+            try:
+                self._slow_log.append(times, values)
+            except Exception as exc:
+                self._close_slow_log()
+                self._slow_panel.set_log_text(f'⚠ log write failed: {exc}')
+        self._slow_dirty = True
+
+    def _on_slow_view_changed(self) -> None:
+        self._slow_history.set_capacity(self._slow_panel.keep_points())
+        self._slow_dirty = True
+
+    def _on_slow_clear(self) -> None:
+        self._slow_history.clear()
+        self._slow_dirty = True
+
+    def _draw_slow(self) -> None:
+        if not self._slow_dirty or not self._slow_canvas.isVisible():
+            return
+        self._slow_dirty = False
+        self._slow_canvas.render(self._slow_history,
+                                 self._slow_panel.selected_series(),
+                                 self._slow_panel.span_seconds())
+
+    def _on_worker_message(self, text: str) -> None:
+        if text.startswith('slow data:'):
+            self._slow_panel.set_status(f'⚠ {text}')
 
     # ── Plot updates ────────────────────────────────────────────────────────────
 
@@ -4285,7 +4612,8 @@ class DaqMainWindow(QMainWindow):
                 name=ch_name,
                 range_idx=row['range'].currentIndex(),
                 coupling=row['coupling'].currentText(),
-                save_mean_only=(row['save'].currentText() == 'Mean'),
+                save_mean_only=(row['save'].currentText() in ('Mean', 'Slow')),
+                slow=(row['save'].currentText() == 'Slow'),
             ))
         if not channels:
             QMessageBox.warning(self, 'No channels', 'Enable at least one channel.')
@@ -4336,6 +4664,7 @@ class DaqMainWindow(QMainWindow):
             'n_div_x':         self._xdiv_spin.value(),
             'psd_span':        self._psdspan_spin.value(),
             'stream_chunk':    self._chunk_spin.value(),
+            'monitor_stream':  self._stream_combo.currentText(),
             'nperseg':         self._nperseg_combo.currentText(),
             'psd_average':     self._psdavg_spin.value(),
             'psd_live':        self._psd_check.isChecked(),
@@ -4364,6 +4693,7 @@ class DaqMainWindow(QMainWindow):
             'show_rms':        self._rms_check.isChecked(),
             # inspector
             'inspect':         self._inspector.to_dict(),
+            'slow':            self._slow_panel.to_dict(),
         }
         if _HAS_PULSES:
             d['pulse'] = dict(
@@ -4424,6 +4754,7 @@ class DaqMainWindow(QMainWindow):
             ('nperseg',      self._nperseg_combo),
             ('ylim_mode',    self._ylim_combo),
             ('rate_unit',    self._rate_unit),
+            ('monitor_stream', self._stream_combo),
         ]:
             if attr in d:
                 idx = widget.findText(str(d[attr]))
@@ -4460,6 +4791,8 @@ class DaqMainWindow(QMainWindow):
                 widget.setChecked(bool(d[attr]))
         if isinstance(d.get('inspect'), dict):
             self._inspector.from_dict(d['inspect'])
+        if isinstance(d.get('slow'), dict):
+            self._slow_panel.from_dict(d['slow'])
         if _HAS_PULSES and isinstance(d.get('pulse'), dict):
             pulse = d['pulse']
             self._pulse_panel.from_dict(pulse)
@@ -4501,6 +4834,7 @@ class DaqMainWindow(QMainWindow):
                 worker.request_stop()
                 worker.wait(5000)
         self._inspector.shutdown()
+        self._close_slow_log()
         if _HAS_PULSES:
             self._pulse_panel.shutdown()      # output off, port closed
         if self._daq:
